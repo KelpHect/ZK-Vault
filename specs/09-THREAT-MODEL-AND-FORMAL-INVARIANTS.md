@@ -118,9 +118,9 @@ Every security claim in RusticStack Core is evaluated against seven explicitly b
 
 | ID | Component / Interface | Attack Scenario | Adversary | Architectural Mitigation | Invariants |
 |---|---|---|---|---|---|
-| `STRIDE-T1` | `vault.vault_items` / `vault_item_revisions` | Compromised server or DBA copies a valid ciphertext blob across tenants, collections, items, or revisions to induce rollback or context confusion. | `ADV-01`, `ADV-02` | Mandatory canonical CBOR AAD `(domain, tenant_id, object_id, parent_id, epoch_or_version, cipher_suite_id)` bound into every `AES-256-GCM` and HPKE/X-Wing envelope; tampering fails authentication deterministically. | `INV-002`, `INV-003` |
+| `STRIDE-T1` | `vault.vault_items` / `vault_item_revisions` | Compromised server or DBA copies a valid ciphertext blob across tenants, collections, items, or revisions to induce rollback or context confusion. | `ADV-01`, `ADV-02` | Mandatory `RSV1` header + `CanonicalAadContext` CBOR map (keys `1..=10` + optional `11: extra_context`, or `"rsv:attach:v1"` for STREAM chunks) bound into every `AES-256-GCM` and HPKE/X-Wing envelope; tampering fails authentication deterministically. | `INV-002`, `INV-003`, `INV-030` |
 | `STRIDE-T2` | `vault.audit_events` & `audit_merkle_tiles` | Malicious operator alters 1 byte in an audit event, deletes an incriminating row, or serves divergent Merkle roots to different auditors (split-view). | `ADV-01`, `ADV-02`, `ADV-05` | RFC 9162 domain-separated Merkle hashing (`0x00` leaves, `0x01` nodes), immutable C2SP `tlog-tiles`, signed `audit_checkpoints`, and independent witness cosignatures verifying append-only consistency proofs. | `INV-018` |
-| `STRIDE-T3` | `vault.tenant_vss_ceremonies` | Malicious admin or compromised coordinator distributes poisoned recovery shares so disaster recovery fails silently during an incident. | `ADV-01`, `ADV-05` | Feldman VSS over Ristretto255 (`vsss-rs` 6.0) publishes commitments `[C_0, ..., C_{t-1}]` for both 128-bit chunks of `ORPK_SEED`; every custodian verifies `g^{s_i} == Π C_j^{i^j}` independently at receipt time without reconstruction. | `INV-015`, `INV-016` |
+| `STRIDE-T3` | `vault.tenant_vss_ceremonies` | Malicious admin or compromised coordinator distributes poisoned recovery shares so disaster recovery fails silently during an incident. | `ADV-01`, `ADV-05` | Feldman VSS over Ristretto255 (`vsss-rs` 6.0) with 2×128-bit chunks + 124-bit CSPRNG high-order scalar padding (`(B_k[31] & 0xF0) == 0`) publishes commitments `[C_0, ..., C_{t-1}]`; every custodian verifies `g^{s_i} == Π C_j^{i^j}` independently without reconstruction. | `INV-015`, `INV-016` |
 | `STRIDE-T4` | `vault.key_graph_edges` | Malicious server injects a cyclic edge (`Team A -> Team B -> Team A`) to cause infinite recursion / DoS during key unwrapping. | `ADV-01` | `rsv-graph` enforces strict DAG stratification (`User -> Team -> Collection -> Item`) and cycle rejection (`GRAPH_CYCLE_REJECTED`) prior to cryptographic unwrapping. | `INV-008` |
 
 ### 3.3 Repudiation (`R`)
@@ -128,45 +128,47 @@ Every security claim in RusticStack Core is evaluated against seven explicitly b
 | ID | Component / Interface | Attack Scenario | Adversary | Architectural Mitigation | Invariants |
 |---|---|---|---|---|---|
 | `STRIDE-R1` | Vault Read / Mutate Operations | Malicious insider denies accessing or modifying a production credential, or denies executing a Delegated Recovery (`DRPK`) operation. | `ADV-05` | Every mutation and sensitive read requires a hardware-signed `X-RSV-Request-Signature` (`HDIK`) and client-encrypted `X-RSV-Audit-Envelope` (`CPubK`), committed to the append-only RFC 9162 Merkle log (`vault.audit_events` + `audit_checkpoints`). | `INV-018`, `INV-019`, `INV-020` |
-| `STRIDE-R2` | Recovery Ceremony Abuse | Trustees attempt an untracked `ORPK_SEED` recovery or share refresh ceremony. | `ADV-05` | Every ceremony in `vault.tenant_vss_ceremonies` records immutable Ristretto255 commitments, participant fingerprints, and signed transcripts anchored into `audit_checkpoints`. | `INV-015`, `INV-016`, `INV-018` |
+| `STRIDE-R2` | Recovery Ceremony Abuse | Trustees attempt an untracked `ORPK_SEED` recovery or share refresh ceremony. | `ADV-05` | Every ceremony in `vault.tenant_vss_ceremonies` records immutable Ristretto255 commitment digests, participant fingerprints, and signed transcripts anchored into `audit_checkpoints`. | `INV-015`, `INV-016`, `INV-018` |
 
 ### 3.4 Information Disclosure (`I`)
 
 | ID | Component / Interface | Attack Scenario | Adversary | Architectural Mitigation | Invariants |
 |---|---|---|---|---|---|
-| `STRIDE-I1` | PostgreSQL Multi-Tenant Shared Schema | Application bug in `rsv-server` omits `WHERE tenant_id = $1`, risking cross-tenant leakage across shared tables. | `ADV-01`, `ADV-05` | Dual enforcement: `TenantScopedTx` calls `set_config('app.current_tenant_id', $1::text, true)` AND requires explicit `WHERE tenant_id = $1`, backed by PostgreSQL `FORCE ROW LEVEL SECURITY` and `NOBYPASSRLS` on `rsv_app`. | `INV-006`, `INV-007` |
+| `STRIDE-I1` | PostgreSQL Multi-Tenant Shared Schema | Application bug in `rsv-server` omits `WHERE tenant_id = $1`, risking cross-tenant leakage across shared tables. | `ADV-01`, `ADV-05` | Dual enforcement: `TenantScopedTx` calls `set_config('app.current_tenant_id', $1::text, true)` AND requires explicit `WHERE tenant_id = $1`, backed by PostgreSQL `FORCE ROW LEVEL SECURITY` and `NOBYPASSRLS` on `rsv_app` across all 17 `vault` tables. | `INV-006`, `INV-007` |
 | `STRIDE-I2` | Native Client RAM / Swap / Crash Dumps | OS swaps unlocked vault memory to disk, dumps core on crash, or malware scans process address space for keys. | `ADV-03` | `LockedSecretBox<T>` enforces page-aligned `mlock`/`VirtualLock`, `PROT_NONE`/`PAGE_NOACCESS` guard pages, `MADV_DONTDUMP`/`PR_SET_DUMPABLE(0)` or `CryptProtectMemory` + DACL, and volatile zeroization on `Drop`. | `INV-010`, `INV-011`, `INV-012` |
-| `STRIDE-I3` | Browser WASM Linear Memory Growth | Browser reallocates WASM linear memory on `memory.grow()`, leaving unzeroized copies of plaintext secrets in freed host heap pages. | `ADV-03`, `ADV-06` | `rsv-wasm` uses a statically bounded fixed linear memory arena with zero `memory.grow()` opcodes in the compiled `.wasm` artifact; JS interacts solely via opaque `KeyHandle(u32)`. | `INV-022`, `INV-024` |
-| `STRIDE-I4` | Observability / Logging / Crash Traces | Developer formats a key struct via `{:?}` or error payload containing `MUK`, `DEK`, passphrase, or decrypted item fields. | `ADV-01`, `ADV-03` | `secrecy::SecretBox` enforces redacted `Debug`, forbids `Display`, installs a scrubbing panic hook, and passes workspace telemetry canary redaction gates. | `INV-011`, `INV-012` |
+| `STRIDE-I3` | Browser WASM Linear Memory Growth | Browser reallocates WASM linear memory on `memory.grow()`, leaving unzeroized copies of plaintext secrets in freed host heap pages. | `ADV-03`, `ADV-06` | `rsv-wasm` enforces a **Dual Fixed-Memory Worker Split** (`16 MiB` persistent `rsv_wasm.wasm` with `2 MiB` `WasmSecretArena` + `144 MiB` ephemeral `rsv_wasm_kdf.wasm`) with zero `memory.grow()` opcodes in BOTH binaries; JS interacts solely via opaque `KeyHandle(u32)`. | `INV-022`, `INV-024` |
+| `STRIDE-I4` | Observability / Logging / Crash Traces | Developer formats a key struct via `{:?}` or error payload containing `MUK`, `DEK`, passphrase, or decrypted item fields. | `ADV-01`, `ADV-03` | `secrecy::SecretBox` and `Redacted<T>` enforce redacted `Debug`, forbid `Display`, install a scrubbing panic hook, and pass workspace telemetry canary redaction gates. | `INV-011`, `INV-012`, `INV-032` |
 | `STRIDE-I5` | Long-Term Quantum Decryption (HNDL) | Adversary archives `CS-01` X25519 ciphertexts or TLS handshakes today and decrypts them later with a CRQC. | `ADV-07` | `CS-02` (`0x0002`) X-Wing (`X25519 + ML-KEM-768` SHA3-256 combiner) + AES-256-GCM + TLS 1.3 `X25519MLKEM768`. | `INV-004` |
-| `STRIDE-I6` | Audit Database Deanonymization | Offline DBA (`ADV-02`) inspects `vault.audit_events` to map user emails, item titles, or admin targets. | `ADV-02` | Searchable lookup columns store `HMAC-SHA256(TBK, "rsv:audit:blind:v1" || ...)` where `TBK` resides strictly in backend KMS/locked RAM (never in PostgreSQL); rich payloads are HPKE/X-Wing sealed to offline `CPubK`. | `INV-017`, `INV-019` |
+| `STRIDE-I6` | Audit Database Deanonymization | Offline DBA (`ADV-02`) inspects `vault.audit_events` to map user emails, item titles, or admin targets. | `ADV-02` | Searchable columns (`blinded_actor_id`, `blinded_resource_id`, `blind_epoch`) store `HMAC-SHA256(TBK_mw, "rsv:audit:blind:v1" || ...)` where `TBK_mw` resides strictly in backend KMS/`rsv-mem` locked RAM (never in PostgreSQL); rich payloads are HPKE/X-Wing sealed to offline `CPubK`. | `INV-017`, `INV-019` |
 
 ### 3.5 Denial of Service (`D`)
 
 | ID | Component / Interface | Attack Scenario | Adversary | Architectural Mitigation | Invariants |
 |---|---|---|---|---|---|
-| `STRIDE-D1` | PostgreSQL Multi-Tenant Query Saturation | Unpruned full-table scan across all 64 hash partitions starves database I/O for neighboring tenants. | `ADV-01`, `ADV-05` | Mandatory `tenant_id` hash partition key (`MODULUS 64`) guarantees `Subplans Removed: 63` with composite `(tenant_id, ...)` indexes and per-tenant rate limits (`RATE_LIMITED`). | `INV-007` |
-| `STRIDE-D2` | Chrome Native Messaging Pipe Termination | Any message exceeding Chrome's hard `1,048,576`-byte limit kills `rsv-nm-host`; unbounded chunk buffers OOM the host. | `ADV-06` | Strict `<= 786,432` B (`768 KiB`) chunking per `schemas/ipc-native-messaging.schema.json` with bounded reassembly window (`16 MiB` total cap, `8` concurrent streams). | `INV-021` |
+| `STRIDE-D1` | PostgreSQL Multi-Tenant Query Saturation | Unpruned full-table scan across all 64 hash partitions starves database I/O for neighboring tenants. | `ADV-01`, `ADV-05` | Mandatory `tenant_id` hash partition key (`MODULUS 64` across 7 high-cardinality tables = 448 partitions) guarantees `Subplans Removed: 63` with composite `(tenant_id, ...)` indexes and per-tenant rate limits (`RATE_LIMITED`). | `INV-007` |
+| `STRIDE-D2` | Chrome Native Messaging Pipe Termination | Any message exceeding Chrome's hard `1,048,576`-byte limit kills `rsv-nm-host`; unbounded chunk buffers OOM the host. | `ADV-06` | Strict `MAX_NM_CHUNK_PAYLOAD_BYTES = 786,432` B (`768 KiB`) chunking inside `MAX_NM_WIRE_FRAME_BYTES = 851,968` B (`832 KiB`) JSON frames per `schemas/ipc-native-messaging.schema.json` with bounded reassembly (`16 MiB` cap, `<= 8` concurrent streams). | `INV-021` |
 | `STRIDE-D3` | Adversarial CBOR / Graph / Crypto Inputs | Malformed CBOR envelopes, non-canonical Ristretto255 bytes, or massive cyclic graphs attempt to panic or OOM parsers. | `ADV-01`, `ADV-06` | `#![forbid(unsafe_code)]`, bounded parser limits, and 7 continuous `cargo-fuzz` (`libFuzzer` + ASAN) harnesses. | `INV-008`, `INV-010` |
 
 ### 3.6 Elevation of Privilege (`E`)
 
 | ID | Component / Interface | Attack Scenario | Adversary | Architectural Mitigation | Invariants |
 |---|---|---|---|---|---|
-| `STRIDE-E1` | Revoked Employee Continuing Decryption | Revoked user retains old cached `TK`/`CK` or server-side authorization bug serves new item revisions to a removed user. | `ADV-01`, `ADV-05` | Revocation bumps `key_epoch`, rotates `TK`/`CK`, re-wraps edges exclusively for remaining authorized members, and invalidates revoked devices (`STALE_KEY_EPOCH`). | `INV-009` |
-| `STRIDE-E2` | Enterprise Admin Reading `root_quorum_only` Vaults | Rogue admin attempts to wrap a `root_quorum_only` collection to `DRPubK` or their own `UPK` to bypass quorum approval. | `ADV-05` | Clients and server policy checks enforce `ESCROW_POLICY_VIOLATION` on any non-`ORPubK` recovery edge for `root_quorum_only` collections; recovery requires `>= t` Feldman VSS trustees. | `INV-005`, `INV-015`, `INV-016` |
-| `STRIDE-E3` | Memory Safety Violation / UB in FFI | Buffer overflow or use-after-free in parsers or cryptography achieves code execution. | `ADV-01`, `ADV-03`, `ADV-06` | `#![forbid(unsafe_code)]` enforced on 10 of 12 workspace crates; `unsafe` quarantined strictly to audited OS FFI in `rsv-mem` and `rsv-enclave`. | `INV-010` |
+| `STRIDE-E1` | Revoked Employee Continuing Decryption | Revoked user retains old cached `TK`/`CK` or server-side authorization bug serves new item revisions to a removed user. | `ADV-01`, `ADV-05` | Revocation bumps `key_epoch`, rotates `TK`/`CK`, re-wraps edges exclusively for remaining authorized members, and invalidates revoked devices (`STALE_KEY_EPOCH`). | `INV-009`, `INV-027` |
+| `STRIDE-E2` | Enterprise Admin Reading `enterprise_escrow` / `strict_zk` Vaults | Rogue admin attempts to wrap an `enterprise_escrow` (root-quorum-only) or `strict_zk` collection to `DRPubK` or their own `UPK` to bypass quorum approval. | `ADV-05` | Clients and server policy checks enforce `ESCROW_POLICY_VIOLATION` on any `DRPubK` edge targeting `enterprise_escrow` or `strict_zk` (and any `ORPubK` edge on `strict_zk`); `enterprise_escrow` recovery requires `>= t` Feldman VSS trustees. | `INV-005`, `INV-015`, `INV-016` |
+| `STRIDE-E3` | Memory Safety Violation / UB in FFI | Buffer overflow or use-after-free in parsers or cryptography achieves code execution. | `ADV-01`, `ADV-03`, `ADV-06` | `#![forbid(unsafe_code)]` enforced on 11 of 13 workspace crates; `unsafe` quarantined strictly to audited OS FFI in `rsv-mem` and `rsv-enclave`. | `INV-010` |
 
 ---
 
-## 4. Formal System Invariants (`INV-001` through `INV-024`)
+## 4. Formal System Invariants (`INV-001` through `INV-036`)
 
-The following 24 invariants constitute the **top-precedence normative security contract** of RusticStack Core (precedence level 1 per `specs/00-INDEX.md`). No release candidate may ship if any invariant lacks a passing deterministic verification check.
+The following 24 core invariants (`INV-001`–`INV-024`) together with the 12 extension invariants (`INV-025`–`INV-036`, cross-referenced in §4.2 and formally specified in `SPEC-11`–`SPEC-15`) constitute the **top-precedence normative security contract** of RusticStack Core (precedence level 1 per `specs/00-INDEX.md`). No release candidate may ship if any of the 36 invariants lacks a passing deterministic verification check.
+
+### 4.1 Core System Invariants (`INV-001` through `INV-024`)
 
 ---
 
 ### `INV-001` — Zero Server Decryption Capability
-- **Formal Statement**: Let $\mathcal{S}$ denote the complete state of `rsv-server` (process memory, logs, traces) and PostgreSQL (`vault` schema) plus `audit_merkle_tiles`. For every plaintext vault item $m$, collection/team metadata $d$, and secret key $k \in \{\text{MUK}, \text{USK}, \text{TK}, \text{CK}, \text{DEK}, \text{ORPK}, \text{ORPK\_SEED}, \text{DRPK}, \text{CPK}\}$, no unencrypted byte of $m, d, k$ ever crosses `/api/v1` or exists in $\mathcal{S}$, and any PPT adversary given $\mathcal{S}$ has negligible advantage ($\le \text{negl}(\lambda)$) in distinguishing $\text{Enc}(m_0)$ from $\text{Enc}(m_1)$.
+- **Formal Statement**: Let $\mathcal{S}$ denote the complete state of `rsv-server` (process memory, logs, traces) and PostgreSQL (all 17 tables in `vault` schema) plus `audit_merkle_tiles`. For every plaintext vault item $m$, collection/team metadata $d$, binary attachment $a$, and secret key $k \in \{\text{MUK}, \text{USK}, \text{TK}, \text{CK}, \text{DEK}, \text{AEK}, \text{ORPK}, \text{ORPK\_SEED}, \text{DRPK}, \text{CPK}\}$, no unencrypted byte of $m, d, a, k$ ever crosses `/api/v1` or exists in $\mathcal{S}$, and any PPT adversary given $\mathcal{S}$ has negligible advantage ($\le \text{negl}(\lambda)$) in distinguishing $\text{Enc}(m_0)$ from $\text{Enc}(m_1)$.
 - **Threat Coverage**: `ADV-01`, `ADV-02`
 - **Owning Crates**: `rsv-types`, `rsv-crypto`, `rsv-graph`, `rsv-server`
 - **Failure Mode**: Server compromise or database exfiltration exposes customer secrets.
@@ -175,22 +177,22 @@ The following 24 invariants constitute the **top-precedence normative security c
 ---
 
 ### `INV-002` — Mandatory AAD Context Binding
-- **Formal Statement**: Every `AES-256-GCM` and HPKE/X-Wing seal operation MUST bind a non-empty RFC 8949 canonical CBOR AAD tuple:
-  $$\text{AAD} = \text{CBOR\_Canonical}(\text{domain}, \text{tenant\_id}, \text{object\_id}, \text{parent\_id}, \text{epoch\_or\_version}, \text{cipher\_suite\_id})$$
-  Empty AAD is forbidden at the type level. Mutating any single AAD component while holding ciphertext, nonce, and key constant MUST deterministically return `CryptoError::AeadAuthenticationFailed`.
+- **Formal Statement**: Every `RSV1` `AES-256-GCM` and HPKE/X-Wing seal operation MUST bind the single canonical AAD byte string defined in `SPEC-02` §4.2:
+  $$\mathsf{AEAD\_AAD} = \mathsf{EnvelopeHeader}[0..52] \parallel \mathsf{EncappedKey} \parallel \mathsf{canonical\_aad\_cbor}$$
+  where `canonical_aad_cbor` is an RFC 8949 Section 4.2 Core Deterministic CBOR map containing integer keys `1..=10` (`1: schema_version`, `2: object_type`, `3: tenant_id`, `4: subject_id`, `5: parent_id`, `6: wrapping_key_role`, `7: wrapping_key_epoch`, `8: target_version_or_epoch`, `9: cipher_suite_id`, `10: escrow_tier`) plus optional key `11: extra_context` for graph/audit metadata (and STREAM attachment chunks per `SPEC-13` bind canonical CBOR AAD with domain `"rsv:attach:v1"`, integer keys `1..=7`, `INV-030`). Empty AAD is forbidden at the type level. Decrypters MUST verify constant-time `SHA-256(canonical_aad_cbor) == EnvelopeHeader.AadHash` before invoking AEAD/HPKE open, and mutating any header byte or AAD field MUST deterministically return `CryptoError::AadMismatch` or `CryptoError::AeadAuthenticationFailed`.
 - **Threat Coverage**: `ADV-01`, `ADV-02`, `ADV-05`
 - **Owning Crates**: `rsv-types`, `rsv-crypto`, `rsv-graph`, `rsv-audit`
-- **Failure Mode**: Ciphertext transplantation across tenants, collections, items, or versions succeeds silently.
-- **Verification Method**: KAT AAD mutation matrix (`specs/10` §2.1) + `proptest` asserting 100% rejection across single-field swaps.
+- **Failure Mode**: Ciphertext transplantation across tenants, collections, items, escrow tiers, or versions succeeds silently.
+- **Verification Method**: KAT AAD mutation matrix (`specs/10` §2.1) + `proptest` asserting 100% rejection across single-field and `RSV1` header mutations.
 
 ---
 
 ### `INV-003` — Nonce Uniqueness & Non-Reuse
-- **Formal Statement**: No `(key, 96-bit nonce)` pair is ever reused under `AES-256-GCM`. Every vault item version samples a fresh random 256-bit `DEK` from CSPRNG (`getrandom`/`OsRng`); standalone AEAD encryptions sample fresh 96-bit CSPRNG nonces; HPKE/X-Wing contexts enforce monotonic sequence counters aborting strictly prior to $2^{32} - 1$.
+- **Formal Statement**: No `(key, 96-bit nonce)` pair is ever reused under `AES-256-GCM`. Every vault item version samples a fresh random 256-bit `DEK` from CSPRNG (`getrandom`/`OsRng`); standalone AEAD encryptions sample fresh 96-bit CSPRNG nonces (with hard rotation cap $q_{\max} = 2^{24}$ wraps per multi-use `CK`/`TK` epoch); HPKE/X-Wing single-shot wraps use fresh ephemeral KEM keys; STREAM attachment chunks use deterministic `nonce_prefix (7B) || BE_u32(chunk_counter) || final_flag (1B)` aborting prior to `u32::MAX`.
 - **Threat Coverage**: `ADV-01`, `ADV-02`
 - **Owning Crates**: `rsv-crypto`
 - **Failure Mode**: GHASH key recovery and catastrophic confidentiality loss under `AES-256-GCM`.
-- **Verification Method**: Type-level nonce ownership (caller-supplied nonces prohibited outside `cfg(feature = "kat-deterministic")`), HPKE sequence-exhaustion test, and $10^5$-envelope uniqueness check (`specs/10` §2.1).
+- **Verification Method**: Type-level nonce ownership (caller-supplied nonces prohibited outside `cfg(feature = "kat-deterministic")`), HPKE/STREAM counter-exhaustion tests, and $10^5$-envelope uniqueness check (`specs/10` §2.1).
 
 ---
 
@@ -206,16 +208,20 @@ The following 24 invariants constitute the **top-precedence normative security c
 ---
 
 ### `INV-005` — Root Quorum Exclusivity & Hybrid Escrow Separation
-- **Formal Statement**: For every collection $C$ classified `root_quorum_only`, the set of recovery escrow edges targeting $C$ MUST contain ONLY an edge wrapped to `ORPubK` (recoverable exclusively via `t`-of-`n` Feldman VSS reconstruction of `ORPK_SEED`) and MUST NEVER contain an edge wrapped to `DRPubK` or any individual Enterprise Admin `UPK`. Attempts to publish a `DRPubK` edge on a `root_quorum_only` vault MUST be rejected client-side and server-side with canonical error `ESCROW_POLICY_VIOLATION`.
+- **Formal Statement**: Every collection $C$ carries a canonical SQL/Rust `EscrowTier` (`standard`, `enterprise_escrow`, `strict_zk`):
+  - `standard`: requires `CK`, `ORPubK`, and `DRPubK` wrappers.
+  - `enterprise_escrow` (root-quorum-only): requires `CK` and `ORPubK` (recoverable exclusively via `t`-of-`n` Feldman VSS reconstruction of `ORPK_SEED`) and **STRICTLY FORBIDS** `DRPubK` or any individual Enterprise Admin `UPK` escrow wrapper.
+  - `strict_zk`: requires `CK` only and **STRICTLY FORBIDS** both `DRPubK` and `ORPubK` escrow wrappers.
+  Attempts to violate `EscrowTier` constraints MUST be rejected client-side and server-side with `ESCROW_POLICY_VIOLATION` (`CryptoError::PolicyViolation`), and `escrow_tier` MUST be authenticated in `CanonicalAadContext` key `10`.
 - **Threat Coverage**: `ADV-05`
-- **Owning Crates**: `rsv-crypto`, `rsv-graph`, `rsv-server`, `rsv-desktop`
-- **Failure Mode**: Single rogue administrator holding `DRPK` unilaterally decrypts regulated break-glass or executive vaults.
-- **Verification Method**: Escrow policy negative suite asserting `ESCROW_POLICY_VIOLATION` when attempting `DRPubK` or admin wrapping on `root_quorum_only` collections (`specs/10` §3.5).
+- **Owning Crates**: `rsv-crypto`, `rsv-graph`, `rsv-server`, `rsv-daemon`, `rsv-desktop`
+- **Failure Mode**: Single rogue administrator holding `DRPK` unilaterally decrypts `enterprise_escrow` or `strict_zk` vaults.
+- **Verification Method**: Escrow policy negative suite asserting `ESCROW_POLICY_VIOLATION` across `standard`, `enterprise_escrow`, and `strict_zk` boundaries (`specs/10` §3.5).
 
 ---
 
 ### `INV-006` — Zero Cross-Tenant RLS Bleed
-- **Formal Statement**: Every tenant-scoped table in schema `vault` MUST enforce `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` with predicate:
+- **Formal Statement**: Every tenant-scoped table across all 17 tables in schema `vault` MUST enforce `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` with predicate:
   $$\text{tenant\_id} = \text{NULLIF}(\text{current\_setting}(\text{'app.current\_tenant\_id'}, \text{true}), \text{''})::\text{uuid}$$
   Every `rsv-server` database query MUST execute inside `TenantScopedTx`, which executes `SELECT set_config('app.current_tenant_id', $1::text, true)` (transaction-local for PgBouncer safety) AND includes an explicit `WHERE tenant_id = $1` clause. Role `rsv_app` MUST possess `NOSUPERUSER NOBYPASSRLS`. Unset or empty context MUST yield 0 rows on `SELECT` and fail with SQLSTATE `42501` on writes.
 - **Threat Coverage**: `ADV-01`, `ADV-05`
@@ -226,16 +232,16 @@ The following 24 invariants constitute the **top-precedence normative security c
 ---
 
 ### `INV-007` — Hash-Partition Pruning Determinism
-- **Formal Statement**: High-cardinality tenant tables (`vault.key_graph_edges`, `vault.vault_items`, `vault.vault_item_revisions`, `vault.audit_events`, `vault.audit_merkle_tiles`) MUST use `PARTITION BY HASH (tenant_id)` with `MODULUS 64`. Every production SQL query against these tables MUST prune 63 of 64 partitions (`Subplans Removed: 63` or single direct partition resolution) and use an index (`Index Cond` containing `tenant_id`, zero `Seq Scan`).
+- **Formal Statement**: All 7 high-cardinality tenant tables (`vault.key_graph_edges`, `vault.vault_items`, `vault.vault_item_revisions`, `vault.audit_events`, `vault.audit_merkle_tiles`, `vault.key_transparency_log`, `vault.vault_attachments`) MUST use `PARTITION BY HASH (tenant_id)` with `MODULUS 64` (448 total physical partitions). Every production SQL query against these tables MUST prune 63 of 64 partitions (`Subplans Removed: 63` or single direct partition resolution) and use an index (`Index Cond` containing `tenant_id`, zero `Seq Scan`).
 - **Threat Coverage**: `ADV-01`, `ADV-05` (noisy-neighbor / DoS)
 - **Owning Crates**: `rsv-server`
 - **Failure Mode**: Full multi-partition scans cause O(N) tail-latency collapse and cross-tenant I/O starvation.
-- **Verification Method**: Automated `EXPLAIN (ANALYZE, FORMAT JSON)` CI assertions verifying `Subplans Removed: 63` and `Index Cond` on all 5 partitioned tables (`specs/10` §3.1).
+- **Verification Method**: Automated `EXPLAIN (ANALYZE, FORMAT JSON)` CI assertions verifying `Subplans Removed: 63` and `Index Cond` across all 7 partitioned tables (`specs/10` §3.1).
 
 ---
 
 ### `INV-008` — Blind RBAC DAG Acyclicity & Authorized Edge Signatures
-- **Formal Statement**: The encrypted access graph $G = (V, E)$ stored in `vault.key_graph_edges` MUST satisfy strict directed stratification ($\text{User} \to \text{Team} \to \text{Collection} \to \text{Item}$, plus direct $\text{User} \to \text{Collection}$ and authorized escrow roots), contain zero directed cycles (`GRAPH_CYCLE_REJECTED`), and carry a valid `UIK` signature from an authorized granter verified client-side before unwrapping any child key.
+- **Formal Statement**: The encrypted access graph $G = (V, E)$ stored in `vault.key_graph_edges` MUST satisfy strict directed stratification ($\text{User} \to \text{Team} \to \text{Collection} \to \text{Item}$, plus direct $\text{User} \to \text{Collection}$, read-only `machine_to_collection` with `permission_mask = 1`, and authorized escrow roots, max depth `4`), contain zero directed cycles (`GRAPH_CYCLE_REJECTED`), and carry a valid `UIK` signature from an authorized granter verified client-side before unwrapping any child key.
 - **Threat Coverage**: `ADV-01`, `ADV-05`
 - **Owning Crates**: `rsv-graph`, `rsv-server`
 - **Failure Mode**: Infinite recursion DoS, privilege escalation via forged edges, or unauthorized key injection.
@@ -253,47 +259,47 @@ The following 24 invariants constitute the **top-precedence normative security c
 ---
 
 ### `INV-010` — Strict Unsafe Code Containment (`unsafe` Firewall)
-- **Formal Statement**: Every Rust crate in the 12-crate workspace MUST declare `#![forbid(unsafe_code)]` at crate root EXCEPT `rsv-mem` and `rsv-enclave`. Within `rsv-mem` and `rsv-enclave`, `#![deny(unsafe_op_in_unsafe_fn)]` MUST be active, all FFI/syscall blocks MUST be isolated inside dedicated platform modules, and every `unsafe` block MUST carry a structured `// SAFETY:` justification verified in security review.
+- **Formal Statement**: Every Rust crate in the 13-crate workspace (11 safe crates: `rsv-types`, `rsv-crypto`, `rsv-vss`, `rsv-graph`, `rsv-audit`, `rsv-wasm`, `rsv-daemon`, `rsv-desktop`, `rsv-cli`, `rsv-server`, `rsv-compliance-cli`) MUST declare `#![forbid(unsafe_code)]` at crate root EXCEPT the 2 audited OS/hardware crates `rsv-mem` and `rsv-enclave`. Within `rsv-mem` and `rsv-enclave`, `#![deny(unsafe_op_in_unsafe_fn)]` MUST be active, all FFI/syscall blocks MUST be isolated inside dedicated platform modules, and every `unsafe` item (`unsafe {`, `unsafe fn`, `unsafe impl`, `unsafe trait`) MUST carry a structured `// SAFETY:` justification verified in security review.
 - **Threat Coverage**: `ADV-01`, `ADV-03`, `ADV-06`
-- **Owning Crates**: All 12 workspace crates
+- **Owning Crates**: All 13 workspace crates
 - **Failure Mode**: Memory safety vulnerabilities (UAF, OOB read/write) undermine cryptographic guarantees.
 - **Verification Method**: Automated CI unsafe-firewall check (`./scripts/ci/check-unsafe-policy.sh` + `cargo geiger`) failing on any violation (`specs/10` §6 Gate 2).
 
 ---
 
 ### `INV-011` — Locked Memory Zeroize-on-Drop
-- **Formal Statement**: All native plaintext key material (`MUK`, `USK`, `TK`, `CK`, `DEK`, `ORPK`, `ORPK_SEED` shares, `CPK`) MUST reside inside `rsv_mem::LockedSecretBox<T>` (and core types wrapped in `secrecy::SecretBox<T>` with `zeroize::ZeroizeOnDrop`), enforcing:
+- **Formal Statement**: All native plaintext key material (`MUK`, `USK`, `TK`, `CK`, `DEK`, `AEK`, `ORPK`, `ORPK_SEED` shares, `CPK`, `TBK_mw`, SSH private keys) MUST reside inside `rsv_mem::LockedSecretBox<T>` (and core types wrapped in `secrecy::SecretBox<T>` with `zeroize::ZeroizeOnDrop`), enforcing:
   1. Page-aligned allocation flanked before and after by `PROT_NONE` (Unix) / `PAGE_NOACCESS` (Windows) guard pages;
-  2. Physical memory locking via `mlock` (Unix) / `VirtualLock` (Windows);
-  3. Core-dump exclusion via `madvise(MADV_DONTDUMP)` + `prctl(PR_SET_DUMPABLE, 0)` (Linux), `RLIMIT_CORE = 0` (macOS), or `CryptProtectMemory` + restrictive owner-only process DACL (Windows);
+  2. Physical memory locking via `mlock` (Unix) / `VirtualLock` (Windows), failing closed with `MemError::MemoryLockDenied` in strict mode;
+  3. Core-dump exclusion via `madvise(MADV_DONTDUMP)` + `prctl(PR_SET_DUMPABLE, 0)` (Linux), `RLIMIT_CORE = 0` (macOS), or `CryptProtectMemory` + restrictive explicit-SID process DACL (Windows);
   4. Volatile zeroization via `zeroize` prior to unlock and deallocation on `Drop`.
 - **Threat Coverage**: `ADV-03`
-- **Owning Crates**: `rsv-mem`, `rsv-crypto`, `rsv-daemon`, `rsv-desktop`, `rsv-compliance-cli`
+- **Owning Crates**: `rsv-mem`, `rsv-crypto`, `rsv-daemon`, `rsv-cli`, `rsv-server` (`TBK_mw`), `rsv-compliance-cli`
 - **Failure Mode**: Unlocked secrets persist in OS swapfiles, hibernation images, crash dumps, or freed heap memory.
 - **Verification Method**: Live Memory Dump & Swap Negative Test inspecting `/proc/self/smaps` (`VmLck`, `dd` flag), `PR_GET_DUMPABLE == 0`, subprocess guard-page `SIGSEGV`/`0xC0000005`, and post-`Drop` zeroed memory verification (`specs/10` §3.2).
 
 ---
 
 ### `INV-012` — Zero Secret Telemetry & Deterministic Crash Redaction
-- **Formal Statement**: No crate in the workspace may emit plaintext key material, passphrases, `MUK`, `DEK`, or decrypted vault item fields into `tracing` logs, OpenTelemetry spans, `Debug`/`Display` strings, HTTP error responses, or GPUI crash dumps. All secret containers MUST print constant `"[REDACTED]"` for `Debug`, omit `Display`, and native binaries MUST install a scrubbing panic hook preventing formatted secrets from reaching stderr or crash reporters.
+- **Formal Statement**: No crate in the 13-crate workspace may emit plaintext key material, passphrases, `MUK`, `DEK`, `AEK`, or decrypted vault item fields into `tracing` logs, OpenTelemetry spans, `Debug`/`Display` strings, HTTP error responses, or GPUI crash dumps. All secret containers MUST print constant `"[REDACTED]"` for `Debug`, omit `Display`, and native binaries MUST install a scrubbing panic hook preventing formatted secrets from reaching stderr or crash reporters.
 - **Threat Coverage**: `ADV-01`, `ADV-03`, `ADV-05`
-- **Owning Crates**: All 12 workspace crates
+- **Owning Crates**: All 13 workspace crates
 - **Failure Mode**: Secrets leak passively into centralized SIEM pipelines, crash telemetry, or API error payloads.
 - **Verification Method**: Canary Secret Telemetry Audit across all crates verifying 0 canary matches across captured `tracing` spans, error chains, HTTP 4xx/5xx responses, and panic outputs (`specs/10` §4.2).
 
 ---
 
 ### `INV-013` — Non-Exportable Hardware Device Key Binding (Two-Tier Hardware Trust)
-- **Formal Statement**: Under Tier-1 hardware trust (`HardwareKeyProvider`), device identity (`HDIK`) and sealing (`HDSK`) private keys MUST be generated as **NIST P-256** non-exportable keys inside Apple Secure Enclave (`kSecAttrTokenIDSecureEnclave`), Linux TPM 2.0 (`tss-esapi` with `fixedTPM | fixedParent | sensitiveDataOrigin`), or Windows CNG/PCPKSP (`MS_PLATFORM_CRYPTO_PROVIDER`). Implementations MUST NEVER claim hardware storage of Ed25519/X25519 keys inside Apple SE; instead, silicon P-256 `HDSK`/`HDIK` seals and attests Tier-2 software vault keys (`USK`, `UIK`). Tier-2 software fallback MUST be explicitly tagged in `vault.user_devices` attestation metadata and auditable by tenant policy (`DEVICE_ATTESTATION_FAILED` when hardware is mandated).
+- **Formal Statement**: Under Tier-1 hardware trust (`HardwareKeyProvider` with `HardwareAttestationLevel::L3HardwareEnclave`), device identity (`HDIK`) and sealing (`HDSK`) private keys MUST be generated as **NIST P-256** non-exportable keys inside Apple Secure Enclave (`kSecAttrTokenIDSecureEnclave`), Linux TPM 2.0 (`tss-esapi` with `fixedTPM | fixedParent | sensitiveDataOrigin`), or Windows CNG/PCPKSP (`MS_PLATFORM_CRYPTO_PROVIDER`). Implementations MUST NEVER claim hardware storage of Ed25519/X25519 keys inside Apple SE; instead, silicon P-256 `HDSK`/`HDIK` seals and attests Tier-2 software vault keys (`USK`, `UIK`). Lower attestation levels (`L2WebauthnRoaming`, `L1SoftwareLockedMem`) MUST be explicitly tagged in `vault.user_devices` attestation metadata and auditable by tenant policy (`DEVICE_ATTESTATION_FAILED` when `L3_HARDWARE_ENCLAVE` is mandated).
 - **Threat Coverage**: `ADV-03`, `ADV-04`
 - **Owning Crates**: `rsv-enclave`, `rsv-daemon`, `rsv-server`
 - **Failure Mode**: Endpoint malware clones device identity keys off the machine, or unsupported silicon claims fail silently at runtime.
-- **Verification Method**: `swtpm` (Linux CI) / macOS SE / Windows CNG provider test suite verifying export rejection, P-256 hardware key operations, and explicit Tier-2 fallback tagging (`specs/10` §3.5).
+- **Verification Method**: `swtpm` (Linux CI) / macOS SE / Windows CNG provider test suite verifying export rejection, P-256 hardware key operations, low-S signatures, `destroy_device_keys`, and explicit attestation level tagging (`specs/10` §3.5).
 
 ---
 
 ### `INV-014` — Mutual OS IPC Peer Identity Verification
-- **Formal Statement**: Every local IPC connection accepted by `rsv-daemon` (Unix Domain Socket with `0600` mode in `0700` user directory on Linux/macOS; Windows Named Pipe with owner-only SDDL DACL) MUST validate kernel peer credentials (`SO_PEERCRED` UID == daemon UID + executable binary validation on Linux/macOS; Named Pipe client token SID == daemon SID + `GetNamedPipeClientProcessId` validation on Windows) BEFORE deserializing or dispatching any RPC message.
+- **Formal Statement**: Every local IPC connection accepted by `rsv-daemon` (Unix Domain Socket with `0600` mode in `0700` user directory on Linux/macOS; Windows Named Pipe with explicit-SID protected SDDL DACL `D:P(A;;GA;;;<CURRENT_USER_SID>)`) MUST validate kernel peer credentials (`SO_PEERCRED` UID == daemon UID + executable binary validation on Linux/macOS; Named Pipe client token SID == daemon SID + `GetNamedPipeClientProcessId` validation on Windows) BEFORE deserializing or dispatching any RPC message.
 - **Threat Coverage**: `ADV-03`
 - **Owning Crates**: `rsv-daemon`
 - **Failure Mode**: Malicious local process or secondary OS user invokes `rsv-daemon` to extract unlocked secrets or forge signatures.
@@ -301,32 +307,34 @@ The following 24 invariants constitute the **top-precedence normative security c
 
 ---
 
-### `INV-015` — Feldman VSS Share Verifiability Without Reconstruction
-- **Formal Statement**: During an `ORPK_SEED` (`256`-bit) `t`-of-`n` Feldman VSS ceremony over Ristretto255 (`vsss-rs` 6.0, encoded as two 128-bit little-endian scalar chunks $s_{\text{lo}}, s_{\text{hi}} \in \mathbb{Z}_\ell$), every trustee share $(i, y_{\text{lo},i}, y_{\text{hi},i})$ MUST verify independently against published Ristretto255 commitments $\{C_{\text{lo},j}\}_{j=0}^{t-1}, \{C_{\text{hi},j}\}_{j=0}^{t-1}$:
-  $$y_{\text{lo},i} \cdot B = \sum_{j=0}^{t-1} i^j \cdot C_{\text{lo},j} \quad \land \quad y_{\text{hi},i} \cdot B = \sum_{j=0}^{t-1} i^j \cdot C_{\text{hi},j}$$
-  Verification MUST NOT require any other trustee's share and MUST deterministically reject any 1-bit mutation in share index, chunk scalar, or commitment point.
-- **Threat Coverage**: `ADV-01`, `ADV-05`
+### `INV-015` — Feldman VSS Share Verifiability Without Reconstruction (124-Bit Padded Ristretto255)
+- **Formal Statement**: During an `ORPK_SEED` (`256`-bit) `t`-of-`n` Feldman VSS ceremony over Ristretto255 (`vsss-rs` 6.0, `SPEC-02` §6.1 / `ADR-0001`), `ORPK_SEED` MUST be decomposed into two 128-bit chunks (`chunk_0 = ORPK_SEED[0..16]`, `chunk_1 = ORPK_SEED[16..32]`), each blinded with **124 bits of independent CSPRNG high-order scalar padding** ($B_k[0..16] = \text{chunk}_k$, $B_k[16..31] = r_k[0..15]$, $B_k[31] = r_k[15] \mathbin{\&} \texttt{0x0F}$, guaranteeing uniform $s_k \in [0, 2^{252}) < \ell$ and `(B_k[31] & 0xF0) == 0x00`) to defeat $O(2^{64})$ Pollard Kangaroo attacks against the constant commitments $C_{k,0} = s_k \cdot G$. Every custodian share $(i, y_{0,i}, y_{1,i})$ MUST verify non-interactively against published Ristretto255 commitments $\{C_{0,j}\}_{j=0}^{t-1}, \{C_{1,j}\}_{j=0}^{t-1}$ (computing $y_{k,i} \cdot G$ in constant time):
+  $$y_{0,i} \cdot G = \sum_{j=0}^{t-1} i^j \cdot C_{0,j} \quad \land \quad y_{1,i} \cdot G = \sum_{j=0}^{t-1} i^j \cdot C_{1,j}$$
+  Verification MUST NOT require any other custodian's share and MUST deterministically reject any 1-bit mutation in share index, chunk scalar, or commitment point. Raw commitments $\{C_{k,j}\}$ MUST be HPKE-encrypted per custodian in `vault.tenant_vss_ceremonies` (`SPEC-02` §6.3) to prevent HNDL quantum DLog attacks.
+- **Threat Coverage**: `ADV-01`, `ADV-05`, `ADV-07`
 - **Owning Crates**: `rsv-vss`, `rsv-compliance-cli`
-- **Failure Mode**: Poisoned recovery shares remain undetected until an emergency, permanently bricking org disaster recovery.
-- **Verification Method**: 3-of-5 Feldman VSS KAT vectors (including single-bit tamper rejection) + `proptest` across `2 <= t <= n <= 32` (`specs/10` §2.4).
+- **Failure Mode**: Unpadded 128-bit commitments fall to $2^{64}$ Pollard Kangaroo DLog attacks, or poisoned recovery shares remain undetected until an emergency.
+- **Verification Method**: 3-of-5 padded Feldman VSS KAT vectors (verifying `(B_k[31] & 0xF0) == 0x00`, single-bit tamper rejection, and 124-bit uniformity) + `proptest` across `2 <= t <= n <= 32` (`specs/10` §2.4).
 
 ---
 
 ### `INV-016` — VSS Threshold Secrecy & Exact Quorum Reconstruction
-- **Formal Statement**: Fewer than $t$ Feldman VSS shares reveal zero computational information about `ORPK_SEED` (under DDH in Ristretto255), and `rsv-vss::reconstruct` MUST reject any share set with $< t$ distinct verified shares (`QUORUM_THRESHOLD_UNMET`). Any subset of $\ge t$ distinct verified shares MUST reconstruct the bit-exact 256-bit `ORPK_SEED` across all CPU architectures and WASM, deterministically expanding identical `ORPK`/`ORPubK` fingerprints.
+- **Formal Statement**: Fewer than $t$ Feldman VSS shares reveal zero computational information about `ORPK_SEED` (under DDH in Ristretto255 with full ~126-bit commitment hiding via 124-bit scalar padding), and `rsv-vss::reconstruct_orpk_seed` MUST reject any share set with $< t$ distinct verified shares (`QUORUM_THRESHOLD_UNMET`). Any subset of $\ge t$ distinct verified shares MUST reconstruct padded scalars $s_0, s_1$ satisfying $s_k \cdot G == C_{k,0}$ and `(B_k[31] & 0xF0) == 0x00` (`ReconstructedPaddingInvariantViolated` otherwise), discard the 124-bit padding to recover bit-exact `ORPK_SEED = B_0[0..16] || B_1[0..16]` across all CPU architectures and WASM, and deterministically derive identical `ORPK`/`ORPubK` fingerprints.
 - **Threat Coverage**: `ADV-01`, `ADV-02`, `ADV-05`
 - **Owning Crates**: `rsv-vss`, `rsv-compliance-cli`
 - **Failure Mode**: Sub-quorum collusion recovers `ORPK`, or legitimate quorum fails cross-platform reconstruction.
-- **Verification Method**: Exhaustive $\binom{5}{3} = 10$ subset reconstruction KATs + duplicate-index and `(t-1)` negative tests (`specs/10` §2.4).
+- **Verification Method**: Exhaustive $\binom{5}{3} = 10$ subset reconstruction KATs + duplicate-index, padding-bound, proactive-refresh cross-epoch mix, and `(t-1)` negative tests (`specs/10` §2.4).
 
 ---
 
-### `INV-017` — Zero-Knowledge Blinded Audit Indexing (`TBK` Isolation)
-- **Formal Statement**: Server-indexed lookup columns in `vault.audit_events` (`actor_blind_id`, `target_blind_id`, `action_blind_tag`) MUST be computed as domain-separated `HMAC-SHA256(TBK, "rsv:audit:blind:v1" || tenant_id || field_domain || canonical_value)`. The per-tenant `TBK` MUST reside strictly in backend KMS/locked memory and MUST NEVER be persisted in PostgreSQL, ensuring database snapshots (`ADV-02`) cannot correlate or invert blinded identifiers.
+### `INV-017` — Zero-Knowledge Blinded Audit Indexing (`TBK_mw` Isolation)
+- **Formal Statement**: Server-indexed lookup columns in `vault.audit_events` (`blinded_actor_id`, `blinded_resource_id`, `blind_epoch`) MUST be computed as exact domain-separated HMAC-SHA256 tags keyed by the per-tenant middleware blinding key `TBK_mw`:
+  $$\text{tag} = \text{HMAC-SHA256}\Big(\text{TBK}_{\text{mw}},\ \texttt{"rsv:audit:blind:v1"} \parallel \text{tenant\_id}_{16\text{B}} \parallel \text{BE\_u32}(\text{blind\_epoch}) \parallel \text{field\_domain\_tag}_{1\text{B}} \parallel \text{entity\_uuid}_{16\text{B}}\Big)$$
+  where `field_domain_tag` is `0x01` (`actor` -> `blinded_actor_id`) or `0x02` (`resource` -> `blinded_resource_id`). `TBK_mw` MUST reside strictly in backend KMS / `rsv-mem` `mlock`'d RAM and MUST NEVER be persisted in PostgreSQL, ensuring database snapshots (`ADV-02`) cannot correlate or invert blinded identifiers across epochs or tenants.
 - **Threat Coverage**: `ADV-02`
 - **Owning Crates**: `rsv-audit`, `rsv-server`
 - **Failure Mode**: Database backups or DBA inspection expose who accessed which enterprise secrets.
-- **Verification Method**: Blinded HMAC KAT vectors + domain/tenant separation tests + DDL check verifying zero `TBK` or plaintext identity columns in PostgreSQL (`specs/10` §2.5).
+- **Verification Method**: Blinded HMAC KAT vectors + `field_domain_tag`/`blind_epoch`/`tenant_id` separation tests + DDL audit verifying `blinded_actor_id`, `blinded_resource_id`, `blind_epoch` columns and zero `TBK_mw` storage in PostgreSQL (`specs/10` §2.5).
 
 ---
 
@@ -343,7 +351,7 @@ The following 24 invariants constitute the **top-precedence normative security c
 ---
 
 ### `INV-019` — Air-Gapped Compliance Envelope Decryptability
-- **Formal Statement**: Every mutating and sensitive read request to `/api/v1` MUST include `X-RSV-Audit-Envelope` (otherwise rejected with `MISSING_AUDIT_ENVELOPE`), encrypted client-side via HPKE/X-Wing to the tenant's standalone `CPubK` with AAD binding `(tenant_id, device_id, idempotency_key, event_type_code)`. `rsv-compliance-cli` MUST verify RFC 9162 proofs and decrypt exported envelopes completely air-gapped (zero network crates in `Cargo.toml`, verified inside `unshare -rn`) using offline `CPK`.
+- **Formal Statement**: Every mutating and sensitive read request to `/api/v1` MUST include `X-RSV-Audit-Envelope` (otherwise rejected with `MISSING_AUDIT_ENVELOPE`), encrypted client-side via `RSV1` HPKE/X-Wing to the tenant's standalone `CPubK` binding the unified `SPEC-02` §4.2 `EnvelopeHeader[0..52] || EncappedKey || CanonicalAadContext` CBOR map (`object_type = "audit_event_payload"`, `subject_id = audit_event_id`, `parent_id = tenant_id`, `wrapping_key_role = "cpubk"`, keys `1..=10` + optional key `11: extra_context` binding `(device_id, idempotency_key, action_category)`). `rsv-compliance-cli` MUST verify RFC 9162 proofs and decrypt exported envelopes completely air-gapped (zero network crates in `Cargo.toml`, verified inside `unshare -rn`) using offline `CPK`.
 - **Threat Coverage**: `ADV-01`, `ADV-02`, `ADV-05`
 - **Owning Crates**: `rsv-audit`, `rsv-server`, `rsv-compliance-cli`
 - **Failure Mode**: Compliance officers cannot independently inspect or verify audit logs without relying on live cloud infrastructure.
@@ -352,51 +360,90 @@ The following 24 invariants constitute the **top-precedence normative security c
 ---
 
 ### `INV-020` — Hardware-Backed Request Non-Repudiation & Replay Resistance
-- **Formal Statement**: Every authenticated `/api/v1` request MUST carry `Authorization`, `X-RSV-Tenant-Id`, `X-RSV-Device-Id`, `X-RSV-Request-Signature`, `X-RSV-Audit-Envelope` (on mutations/sensitive reads), and `Idempotency-Key`. `rsv-server` MUST verify `X-RSV-Request-Signature` against the active device public `HDIK` (or Tier-2 device key) registered in `vault.user_devices` over canonical `(method, path, tenant_id, device_id, timestamp, idempotency_key, sha256(body), sha256(audit_envelope))`, rejecting invalid signatures (`INVALID_SIGNATURE`), cross-tenant headers (`TENANT_MISMATCH`), clock skew $|\Delta t| > 300\text{s}$, and replayed/conflicting `Idempotency-Key` submissions.
+- **Formal Statement**: Every authenticated `/api/v1` request MUST carry `Authorization`, `X-RSV-Tenant-Id`, `X-RSV-Device-Id`, `X-RSV-Request-Signature`, `X-RSV-Audit-Envelope` (on mutations/sensitive reads), and `Idempotency-Key` (on mutations). `rsv-server` MUST verify `X-RSV-Request-Signature` against the active device public `HDIK` (or policy-permitted `UIK`) registered in `vault.user_devices` over the exact **11-line LF-delimited `RSV-REQ-SIG-V1`** canonical signing input:
+  1. `RSV-REQ-SIG-V1`
+  2. `<UPPERCASE_HTTP_METHOD>`
+  3. `<CANONICAL_REQUEST_PATH>`
+  4. `<CANONICAL_QUERY_STRING>`
+  5. `<LOWERCASE_X_RSV_TENANT_ID>`
+  6. `<LOWERCASE_X_RSV_DEVICE_ID>`
+  7. `<TIMESTAMP_UNIX_MS>`
+  8. `<NONCE_BASE64URL>`
+  9. `<LOWERCASE_HEX_SHA256_BODY>`
+  10. `<LOWERCASE_HEX_SHA256_AUDIT_ENVELOPE>`
+  11. `<IDEMPOTENCY_KEY_OR_EMPTY>`
+  Server MUST reject invalid signatures (`INVALID_SIGNATURE`), cross-tenant headers (`TENANT_MISMATCH`), clock skew $|\Delta t| > 300\text{s}$, replayed `(tenant_id, device_id, nonce)`, and conflicting `Idempotency-Key` payload digests (`VERSION_CONFLICT`).
 - **Threat Coverage**: `ADV-01`, `ADV-05`
-- **Owning Crates**: `rsv-types`, `rsv-crypto`, `rsv-server`, `rsv-daemon`
-- **Failure Mode**: Stolen bearer tokens or replayed requests enable unauthorized mutations or repudiable audit entries.
-- **Verification Method**: `rsv-server/tests/request_auth_security.rs` negative matrix testing missing headers, mutated path/tenant/body, stale timestamps, revoked devices, and replayed idempotency keys (`specs/10` §3.5).
+- **Owning Crates**: `rsv-types`, `rsv-crypto`, `rsv-server`, `rsv-daemon`, `rsv-cli`
+- **Failure Mode**: Stolen bearer tokens or replayed/parameter-tampered requests enable unauthorized mutations or repudiable audit entries.
+- **Verification Method**: `rsv-server/tests/request_auth_security.rs` negative matrix testing all 11 canonical lines (including `query_string`, `nonce`, and `Idempotency-Key`), stale timestamps, revoked devices, and replays (`specs/10` §3.5).
 
 ---
 
 ### `INV-021` — Native Messaging Sub-1MiB Framing Compliance
-- **Formal Statement**: Every wire frame written by `rsv-nm-host` to Chrome/Chromium MV3 Native Messaging MUST begin with a 4-byte unsigned little-endian length prefix $L$ satisfying $L \le 786{,}432$ bytes (`768 KiB`, strictly below Chrome's hard `1,048,576`-byte host-to-extension cutoff) per `schemas/ipc-native-messaging.schema.json`. Logical payloads exceeding `768 KiB` MUST automatically segment into indexed chunks `(msg_id, chunk_idx, total_chunks, payload)` with bounded reassembly (`<= 16 MiB` total message size, `<= 8` concurrent streams).
+- **Formal Statement**: Every wire frame exchanged between `rsv-nm-host` and the Chrome/Chromium MV3 extension per `schemas/ipc-native-messaging.schema.json` MUST enforce two distinct strict ceilings strictly below Chrome's hard `1,048,576`-byte (`1 MiB`) host-to-extension kill limit:
+  1. **`MAX_NM_CHUNK_PAYLOAD_BYTES = 786_432`** (`768 KiB`): maximum raw `payload_chunk` size per `ChunkEnvelope`;
+  2. **`MAX_NM_WIRE_FRAME_BYTES = 851_968`** (`832 KiB`): maximum serialized UTF-8 JSON wire frame length encoded in Chrome's 32-bit native-endian `u32` length prefix (leaving `> 196 KiB` headroom below Chrome's `1 MiB` ceiling).
+  Logical payloads exceeding `786,432` bytes MUST segment into indexed `ChunkEnvelope` messages with authenticated reassembly capped at `16 MiB` total active buffer (`MAX_NM_REASSEMBLY_BYTES`, up to 64 chunks schema max) and `<= 8` concurrent streams (`MAX_CONCURRENT_NM_STREAMS`).
 - **Threat Coverage**: `ADV-06` (DoS / channel termination)
-- **Owning Crates**: `rsv-daemon` (`rsv-nm-host`), browser extension
-- **Failure Mode**: Chrome forcibly kills the Native Messaging host on payloads `> 1 MiB`, or adversarial chunk floods OOM `rsv-nm-host`.
-- **Verification Method**: Multi-chunk KAT vectors (`0 B`, `768 KiB`, `768 KiB + 1 B`, `3.2 MiB`), `proptest`, and `fuzz_nm_chunk_reassembler` asserting `frame_payload_len <= 786_432` on every emitted frame (`specs/10` §2.7, §3.4).
+- **Owning Crates**: `rsv-daemon` (`rsv-nm-host`), `clients/extension`
+- **Failure Mode**: Chrome forcibly kills the Native Messaging host on frames `> 1 MiB`, or adversarial chunk floods OOM `rsv-nm-host`.
+- **Verification Method**: Multi-chunk KAT vectors (`0 B`, `768 KiB`, `768 KiB + 1 B`, `3.2 MiB`), `proptest`, and `fuzz_nm_chunk_reassembler` asserting `payload_chunk <= 786_432` AND `wire_frame_u32 <= 851_968` on every emitted frame (`specs/10` §2.7, §3.4).
 
 ---
 
 ### `INV-022` — Opaque Key Handle Boundary Across WASM/JS
-- **Formal Statement**: No raw key bytes (`MUK`, `USK`, `TK`, `CK`, `DEK`, `ORPK`) may cross the `rsv-wasm` `wasm-bindgen` FFI boundary into JavaScript. JavaScript interacts exclusively via opaque `KeyHandle(u32)` tokens encoding slot index + monotonic generation counter, with automatic TTL expiration and `lock_vault()` immediate bulk zeroization and handle invalidation.
+- **Formal Statement**: No raw key bytes (`MUK`, `USK`, `TK`, `CK`, `DEK`, `AEK`, `ORPK`) may cross the `rsv-wasm` `wasm-bindgen` FFI boundary into JavaScript. JavaScript interacts exclusively via opaque `KeyHandle(u32)` tokens packing `(generation: u16) << 16 | (slot_index: u16)`, with automatic TTL expiration and `rsv_wasm_wipe_all()` / `lock_vault()` immediate bulk zeroization and handle invalidation (`WasmCryptoError::StaleKeyHandle`).
 - **Threat Coverage**: `ADV-06`, `ADV-03`
 - **Owning Crates**: `rsv-wasm`
 - **Failure Mode**: JavaScript heap snapshots or untrusted browser scripts extract raw master keys directly from JS objects.
-- **Verification Method**: Generated TypeScript `.d.ts` signature audit + `wasm-pack test` verifying generation invalidation after `lock_vault()` (`specs/10` §3.5).
+- **Verification Method**: Generated TypeScript `.d.ts` signature audit + `wasm-pack test` verifying generation invalidation after `rsv_wasm_wipe_all()` (`specs/10` §3.5).
 
 ---
 
 ### `INV-023` — Origin-Bound Autofill & Anti-Phishing Isolation
-- **Formal Statement**: Browser extension and desktop autofill MUST enforce all four conditions simultaneously before populating any DOM input:
+- **Formal Statement**: Browser extension and desktop autofill MUST enforce all four conditions simultaneously before populating any DOM input (extended with Closed Shadow DOM & 5-point hit-test occlusion guards in `INV-035`):
   1. Target scheme is strictly `https://` (rejecting `http://`, `data:`, `javascript:`, `file:`);
-  2. Canonical ASCII/Punycode origin matches the vault item's bound origin (exact host or policy-approved eTLD+1), defeating IDN homographs;
+  2. Canonical ASCII/UTS #46 Punycode origin matches the vault item's bound origin (exact host or policy-approved PSL eTLD+1), defeating IDN homographs;
   3. Frame context is top-level or strictly same-origin with top-level document (zero cross-origin `<iframe>` silent fills);
-  4. Explicit user gesture occurred in the active interaction cycle (zero silent page-load fills).
+  4. Explicit trusted user gesture (`event.isTrusted === true`) occurred in the active interaction cycle (zero silent page-load fills).
 - **Threat Coverage**: `ADV-06`
-- **Owning Crates**: `rsv-types`, `rsv-wasm`, `rsv-daemon`, browser extension
+- **Owning Crates**: `rsv-types`, `rsv-wasm`, `rsv-daemon`, `clients/extension`
 - **Failure Mode**: Phishing domains, hidden cross-origin iframes, or clickjackers silently harvest enterprise credentials.
-- **Verification Method**: Automated origin-matching security matrix + `fuzz_origin_matcher` (`specs/10` §3.4, §3.5).
+- **Verification Method**: Automated origin-matching security matrix + `fuzz_origin_matcher` + Playwright 12-vector hostile-page suite (`specs/10` §3.4, §3.5, `SPEC-15`).
 
 ---
 
-### `INV-024` — Fixed WASM Arena Zero-Growth Invariant
-- **Formal Statement**: The compiled `rsv-wasm` WebAssembly binary (`rsv_wasm_bg.wasm`) MUST pre-allocate a statically bounded fixed linear memory arena (`initial_pages == maximum_pages`, e.g., `256` pages = `16 MiB`) and MUST contain **zero** `memory.grow` WebAssembly instructions in the release `.wasm` artifact. On arena exhaustion, calls MUST return `WasmError::ArenaExhausted` cleanly instead of growing linear memory.
+### `INV-024` — Dual Fixed-Memory WASM Arena Zero-Growth Invariant
+- **Formal Statement**: `rsv-wasm` MUST execute under the **Dual Fixed-Memory Worker Split** (`SPEC-03` / `ADR-0008`) separating persistent vault cryptography from memory-hard KDF derivation:
+  1. **Core Crypto Worker (`rsv_wasm.wasm`)**: statically bounded to `initial == maximum == 256` WebAssembly 64 KiB pages (`16 MiB` total linear memory) housing a dedicated `2 MiB` zeroizable `WasmSecretArena` (`rsv_wasm_wipe_all()`);
+  2. **Ephemeral Argon2id KDF Worker (`rsv_wasm_kdf.wasm`)**: statically bounded to `initial == maximum == 2304` pages (`144 MiB` total linear memory, accommodating Argon2id `m = 64 MiB` and `128 MiB` without growth), zeroizing its KDF matrix and terminating via `worker.terminate()` immediately upon completing `MUK` derivation.
+  **BOTH** compiled release `.wasm` binaries (`rsv_wasm.wasm` AND `rsv_wasm_kdf.wasm`) MUST contain **zero** `memory.grow` (`Operator::MemoryGrow`) opcodes. On arena saturation, calls MUST return `WasmError::ArenaExhausted` cleanly instead of growing linear memory.
 - **Threat Coverage**: `ADV-03`, `ADV-06`
-- **Owning Crates**: `rsv-wasm`
-- **Failure Mode**: Browser runtime reallocates WASM linear memory during `memory.grow()`, leaving unzeroized plaintext copies of secrets in detached host `ArrayBuffer` memory.
-- **Verification Method**: Automated `wasmparser` binary inspection gate asserting `memory.initial == memory.maximum` and `count(Operator::MemoryGrow) == 0`, plus `wasm-pack` arena saturation test (`specs/10` §3.2, §6 Gate 5).
+- **Owning Crates**: `rsv-wasm`, `clients/web-spa`, `clients/extension`
+- **Failure Mode**: Browser JS runtime reallocates WASM linear memory during `memory.grow()`, leaving unzeroized plaintext copies of secrets or Argon2id matrices orphaned in detached host `ArrayBuffer` memory.
+- **Verification Method**: Automated `wasmparser` binary inspection gate asserting `memory.initial == memory.maximum` and `count(Operator::MemoryGrow) == 0` on **BOTH** `rsv_wasm.wasm` (`256` pages) and `rsv_wasm_kdf.wasm` (`2304` pages), plus `2 MiB` `WasmSecretArena` full-wipe and Argon2id `64/128 MiB` browser tests (`specs/10` §3.2, §6 Gate 5).
+
+---
+
+### 4.2 Extension Formal System Invariants Cross-Reference (`INV-025` through `INV-036`)
+
+The following 12 normative invariants extend `INV-001`–`INV-024` across Enterprise Identity, Developer Secrets, Streaming Attachments, Offline Sync, Sovereign Operations, and Client UI/UX. Each carries full top-precedence enforcement (Level 1 per `specs/00-INDEX.md`) and maps 1:1 into `specs/10` §5:
+
+| Invariant ID | Formal Name | Governing Spec & ADR | Owning Crates / Surfaces | Normative Guarantee Summary |
+|---|---|---|---|---|
+| **`INV-025`** | Auditable Key Transparency Inclusion & Consistency on Every Provisioning Grant | `SPEC-11` §1.2, `ADR-0009` | `rsv-audit`, `rsv-graph`, `rsv-server`, `rsv-daemon`, `rsv-wasm` | Every `TK`/`CK`/`DEK` wrap requires a type-state `VerifiedKtRecipient` proving witness-cosigned C2SP KT checkpoint inclusion, consistency, and `UIK` continuity (`KT_PROOF_INVALID` / `KT_SPLIT_VIEW_DETECTED`). |
+| **`INV-026`** | Strict `Authentication != Decryption` Separation for OIDC/SAML SSO | `SPEC-11` §1.2, `ADR-0009` | `rsv-server`, `rsv-daemon`, `clients/web-spa` | OIDC/SAML assertions (`SSO_ASSERTION_INVALID`) authenticate sessions only and NEVER grant, derive, or escrow `MUK`/`USK`/`TK`/`CK`/`DEK`; new-device enrollment requires Trusted Device Cross-Signing (`ENROLLMENT_EXPIRED` after 300s) or Recovery Kit. |
+| **`INV-027`** | Blind SCIM 2.0 Zero-Key Custody | `SPEC-11` §1.2, `ADR-0009` | `rsv-server`, `rsv-graph` | `/scim/v2/*` accepts SCIM-only tokens (`SCIM_SCOPE_VIOLATION` on `/api/v1/*`), performs `< 100 ms` logical revocation, appends unsigned `vault.scim_pending_intents` rows, and NEVER touches key material. |
+| **`INV-028`** | Hardware/Biometric User-Presence Gating & Zero-Disk SSH Private Key Isolation | `SPEC-12` §1.2, `ADR-0010` | `rsv-daemon`, `rsv-mem`, `rsv-enclave`, `rsv-desktop` | RFC 9987 SSH private keys live strictly in `rsv-mem` locked RAM or silicon P-256 (zero `~/.ssh/id_*` disk files), gated by native biometric/UV approval (forced on `session-bind` forwarding) and `ssh.sign` Merkle audit. |
+| **`INV-029`** | Ephemeral Child-Process Memory Injection (`rsv run`) with Zero `.env` Persistence | `SPEC-12` §1.2, `ADR-0010` | `rsv-cli`, `rsv-daemon`, `rsv-server` | `rsv run` resolves `rsv://` URIs strictly via OS IPC or OIDC Machine Identity (`permission_mask = 1`), injects directly into child `envp` (zero `.env` temp files), scrubs parent buffers, and supports streaming output masking. |
+| **`INV-030`** | STREAM Chunked AEAD Anti-Truncation, Anti-Reordering & Constant-Memory Integrity | `SPEC-13` §5, `ADR-0011` | `rsv-types`, `rsv-crypto`, `rsv-wasm`, `rsv-daemon`, `rsv-server` | 64 KiB `AES-256-GCM` chunks with `nonce_prefix(7B) || BE_u32(counter) || final_flag(1B)` + canonical CBOR AAD `"rsv:attach:v1"` + BLAKE3 ciphertext root; `< 256 KiB` RAM/stream on server; zero `memory.grow` in WASM. |
+| **`INV-031`** | Zero-Plaintext Offline Cache Sealing (`HDSK`) & Lossless 3-Way Conflict Surfacing | `SPEC-13` §5, `ADR-0011` | `rsv-daemon`, `rsv-desktop`, `rsv-types`, `rsv-server` | Local cache pages are 4 KiB `AES-256-GCM` encrypted under `HDSK`-sealed `CacheKey` (zero plaintext metadata on disk); `409 VERSION_CONFLICT` surfaces lossless `ConflictPair` merge workflows (zero silent overwrite). |
+| **`INV-032`** | Zero-Secret Structured Telemetry & Sovereign Zero-Phone-Home Enforcement | `SPEC-14` §5, `ADR-0012` | `rsv-types`, `rsv-server`, `clients/web-spa` | Compile-time `Redacted<T>` wrappers + finite-enum Prometheus labels (zero PII/IDs/secrets in metrics/logs); Sovereign Profile boots in `unshare -n` with `0` egress packets, zero external CDNs, and `< 128 MiB` active RSS. |
+| **`INV-033`** | Zero-Plaintext UI Persistence & Ephemeral Render Isolation | `SPEC-15` §1.2 | `rsv-desktop`, `clients/extension`, `clients/web-spa`, `rsv-wasm` | Fixed 12-glyph `••••••••••••` masking by default; zero plaintext in DOM `data-*`/ARIA/Web Storage/global stores; `15 s` auto-remask (`<= 30 s` cap) and `<= 50 ms` wipe on unmount, blur, navigation, or lock. |
+| **`INV-034`** | Concealed OS Clipboard Hygiene & Timed Auto-Clear | `SPEC-15` §1.2 | `rsv-daemon`, `rsv-desktop`, `clients/extension`, `clients/web-spa` | Sets macOS `ConcealedType`/`TransientType`, Windows `ExcludeClipboardContentFromMonitorProcessing` + `CanIncludeInClipboardHistory=0`, Linux `x-kde-passwordManagerHint="secret"` (never X11 `PRIMARY`) with 30s Non-Clobber auto-clear. |
+| **`INV-035`** | Explicit User-Gesture Autofill & Closed Shadow-DOM Origin Isolation | `SPEC-15` §1.2 | `clients/extension` | Requires `event.isTrusted === true`, Service Worker authoritative origin + PSL `eTLD+1` + UTS #46 Punycode, 5-point `elementsFromPoint` hit-test, `attachShadow({ mode: "closed" })`, and Phishing-Mismatch Interstitial. |
+| **`INV-036`** | Zero-Trust Thick-Client Org Dashboard Graph Integrity | `SPEC-15` §1.2 | `rsv-graph`, `rsv-audit`, `rsv-wasm`, `rsv-daemon`, `rsv-desktop`, `clients/web-spa` | All Org Admin provisioning, SCIM approvals, rotations, VSS wraps, and machine grants verify `root_manifest_cbor`, `upk_uik_signature`, and KT proof (`INV-025`) client-side inside `rsv-wasm`/`rsv-daemon` prior to sealing keys. |
 
 ---
 
@@ -404,16 +451,16 @@ The following 24 invariants constitute the **top-precedence normative security c
 
 | Primitive | Suite | Standard / Reference | Security Assumption & Effective Bits |
 |---|---|---|---|
-| **AES-256-GCM** | `CS-01`, `CS-02` | NIST SP 800-38D | IND-CCA2 + INT-CTXT under unique 96-bit nonces (`INV-003`); 256-bit classical / 128-bit post-Grover confidentiality, 128-bit integrity. |
+| **AES-256-GCM** | `CS-01`, `CS-02` | NIST SP 800-38D | IND-CCA2 + INT-CTXT under unique 96-bit nonces (`INV-003`, `INV-030`); 256-bit classical / 128-bit post-Grover confidentiality, 128-bit integrity. |
 | **X25519 + HKDF-SHA256 HPKE** | `CS-01` | RFC 9180 (`DHKEM(X25519, HKDF-SHA256)`) | Gap-DH over Curve25519 + PRF of HKDF-SHA256; ~128-bit classical security. |
 | **X-Wing (`X25519 + ML-KEM-768`)** | `CS-02` | `draft-connolly-cfrg-xwing-kem` + FIPS 203 | IND-CCA2 hybrid reduction: holds if **either** ML-KEM-768 (Module-LWE, NIST Level 3) **or** X25519 (Gap-DH) remains hard, with SHA3-256 combiner (`INV-004`). |
 | **Ed25519** | `CS-01`, `CS-02` | RFC 8032 (`verify_strict`) | EUF-CMA under Discrete Log on Edwards25519; strict canonical verification prevents signature malleability and small-subgroup forgery. |
 | **ML-DSA-65** | `CS-02` | FIPS 204 | EUF-CMA under Module-LWE + Module-SIS (NIST Level 3); combined via logical AND with Ed25519 (`INV-004`). |
-| **ECDSA P-256 / ECDH P-256** | Hardware Enclave | FIPS 186-5 / SEC 1 | ECDLP on NIST P-256 confined strictly inside Tier-1 silicon (`Apple SE`, `TPM 2.0`, `Windows CNG`) (`INV-013`). |
-| **Argon2id + WebAuthn PRF** | KDF (`MUK`) | RFC 9106 + W3C WebAuthn L3 | Memory-hard password KDF (`m >= 65536 KiB`, `t >= 3`, `p >= 1`) XORed with `HKDF(WebAuthn PRF)` when enrolled. |
-| **Feldman VSS over Ristretto255** | `rsv-vss` | `vsss-rs` 6.0 / RFC 9496 | Computational hiding under DDH in prime-order Ristretto255 group; unconditional verification soundness for 2×128-bit chunks of `ORPK_SEED` (`INV-015`, `INV-016`). |
-| **RFC 9162 Merkle + C2SP `tlog-tiles`** | `rsv-audit` | RFC 9162 / C2SP `tlog-tiles` | Second-preimage and collision resistance of SHA-256 with `0x00`/`0x01` domain separation (`INV-018`). |
-| **HMAC-SHA256 (`TBK`)** | `rsv-audit` | RFC 2104 | PRF security of HMAC-SHA256 under KMS/RAM-resident 256-bit `TBK`, domain `"rsv:audit:blind:v1"` (`INV-017`). |
+| **ECDSA P-256 / ECDH P-256** | Hardware Enclave | FIPS 186-5 / SEC 1 | ECDLP on NIST P-256 confined strictly inside Tier-1 silicon (`Apple SE`, `TPM 2.0`, `Windows CNG`), low-S normalized (`INV-013`). |
+| **Argon2id + WebAuthn PRF** | KDF (`MUK`) | RFC 9106 + W3C WebAuthn L3 (`SPEC-02` §3.3–3.4) | Memory-hard password KDF on NFC-normalized UTF-8 (`32`-byte salt, `m >= 65536 KiB`, `t >= 3`, `p >= 4`, deterministic across Native & WASM), combined via `K_prf = HKDF-SHA256(prf, tenant_id \|\| user_id, "rsv:muk:webauthn-prf:v1")` (from `prf.eval.first = SHA-256("rsv:webauthn:prf-eval:v1" \|\| tenant_id \|\| user_id)`) and outer `HKDF-SHA256(K_pwd XOR K_prf, salt, "rsv:muk:hybrid:v1:" \|\| tenant_id \|\| user_id)`. |
+| **Feldman VSS over Ristretto255** | `rsv-vss` | `vsss-rs` 6.0 / RFC 9496 (`SPEC-02` §6.1) | Computational hiding (~126-bit DLog via 124-bit CSPRNG high-order scalar padding defeating $2^{64}$ Pollard Kangaroo) under DDH in prime-order Ristretto255; unconditional verification soundness for 2×128-bit chunks of `ORPK_SEED` (`INV-015`, `INV-016`). |
+| **RFC 9162 Merkle + C2SP `tlog-tiles`** | `rsv-audit` | RFC 9162 / C2SP `tlog-tiles` | Second-preimage and collision resistance of SHA-256 with `0x00`/`0x01` domain separation (`INV-018`, `INV-025`). |
+| **HMAC-SHA256 (`TBK_mw`)** | `rsv-audit` | RFC 2104 | PRF security of HMAC-SHA256 under KMS/`rsv-mem` locked-RAM 256-bit `TBK_mw`, domain `"rsv:audit:blind:v1"` + `tenant_id` + `BE_u32(blind_epoch)` + `field_domain_tag` + `entity_uuid` (`INV-017`). |
 
 ---
 

@@ -1,0 +1,21 @@
+# OS & Editor artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Future build artifacts (once Milestone M0 begins)
+/target/
+**/node_modules/
+**/pkg/
+**/dist/
+.env
+.env.*
+*.log
+*.pem
+*.key
+*.shard

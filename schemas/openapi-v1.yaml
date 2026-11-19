@@ -1,0 +1,2664 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: RusticStack Core (ZK-Vault) Blind Zero-Knowledge API
+  version: 1.0.0
+  summary: Normative OpenAPI 3.1 specification for RusticStack Core /api/v1 blind relay, cryptographic RBAC graph, VSS recovery, C2SP audit log, and opaque real-time sync endpoints.
+  description: |
+    Authoritative REST, C2SP `tlog-tiles`, and real-time sync wire specification for **RusticStack Core (`ZK-Vault`)**.
+
+    ### Transport & Serialization Invariants
+    - **TLS 1.3 Mandatory** with hybrid post-quantum key exchange group `X25519MLKEM768` preferred.
+    - **Cryptographic Envelopes** (`AuditEnvelope`, `EncryptedItemEnvelope`, `WrappedKeyEdge`, `VssEscrowBundle`, `DeviceAttestationPayload`, `TenantManifestPayload`) MUST be serialized as **RFC 8949 Section 4.2 Deterministic CBOR** and transmitted in JSON/HTTP headers as unpadded **Base64URL (RFC 4648 Section 5)**.
+    - **Canonical Request Signing** (`X-RSV-Request-Signature`) signs method, normalized path, sorted query, `X-RSV-Tenant-Id`, `X-RSV-Device-Id`, millisecond timestamp, 16-byte nonce, `SHA-256(body)`, and `SHA-256(decoded_audit_envelope)` using `HDIK` or `UIK`.
+  license:
+    name: Dual MIT / Apache-2.0
+    url: https://github.com/KelpHect/ZK-Vault
+  contact:
+    name: RusticStack Core Protocol Maintainers
+    url: https://github.com/KelpHect/ZK-Vault
+
+servers:
+  - url: https://api.rusticstack.example
+    description: Production Zero-Knowledge API Gateway (TLS 1.3 + X25519MLKEM768)
+  - url: https://{tenant_host}
+    description: Dedicated Enterprise / Self-Hosted Instance (Optional mTLS)
+    variables:
+      tenant_host:
+        default: vault.corp.example
+
+tags:
+  - name: Health
+    description: Service readiness, supported cipher suites, and clock synchronization.
+  - name: Auth
+    description: WebAuthn + PRF registration/login ceremonies and rotating session tokens.
+  - name: Tenant & Directory
+    description: Signed tenant manifest, verifiable public key directory, and hardware device attestation.
+  - name: Key Graph
+    description: Hierarchical cryptographic RBAC DAG (Org -> Team -> Collection -> User) and epoch rotations.
+  - name: Vault Items
+    description: Optimistically versioned encrypted vault items and immutable ciphertext revisions.
+  - name: Recovery & Escrow
+    description: Verifiable Secret Sharing (M-of-N VSS) escrow bundles and quorum recovery ceremonies.
+  - name: Audit Log
+    description: Per-tenant C2SP tlog-tiles Merkle transparency log checkpoints, tiles, and signed leaf entries.
+  - name: Sync Stream
+    description: Real-time opaque synchronization stream over WebSocket (rsv-sync.v1) or SSE fallback.
+
+security:
+  - BearerAuth: []
+
+paths:
+  /api/v1/health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Service liveness, readiness, supported cipher suites, and server UTC time
+      security: []
+      responses:
+        '200':
+          description: Service is healthy and ready to serve TLS 1.3 requests.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/webauthn/register/start:
+    post:
+      operationId: startWebAuthnRegister
+      tags: [Auth]
+      summary: Initiate WebAuthn credential registration ceremony with PRF salt generation
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebAuthnRegisterStartRequest'
+      responses:
+        '200':
+          description: WebAuthn PublicKeyCredentialCreationOptions and deterministic PRF salt issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebAuthnRegisterStartResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/webauthn/register/finish:
+    post:
+      operationId: finishWebAuthnRegister
+      tags: [Auth]
+      summary: Complete WebAuthn registration and store encrypted UMK/UIK/UEK identity bundles
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebAuthnRegisterFinishRequest'
+      responses:
+        '201':
+          description: User identity and initial encrypted key bundles created and committed to audit log.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebAuthnRegisterFinishResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/webauthn/login/start:
+    post:
+      operationId: startWebAuthnLogin
+      tags: [Auth]
+      summary: Initiate WebAuthn authentication ceremony returning PRF evaluation salt
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebAuthnLoginStartRequest'
+      responses:
+        '200':
+          description: WebAuthn PublicKeyCredentialRequestOptions and PRF salt issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebAuthnLoginStartResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/webauthn/login/finish:
+    post:
+      operationId: finishWebAuthnLogin
+      tags: [Auth]
+      summary: Verify WebAuthn assertion and issue session tokens plus encrypted UMK/UIK/UEK bundles
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebAuthnLoginFinishRequest'
+      responses:
+        '200':
+          description: Authentication succeeded; short-lived access token, rotating refresh token, and encrypted key bundles returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebAuthnLoginFinishResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/session/refresh:
+    post:
+      operationId: refreshSession
+      tags: [Auth]
+      summary: Rotate single-use refresh token and mint fresh access token (reuse triggers full family revocation)
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRefreshRequest'
+      responses:
+        '200':
+          description: Session tokens rotated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionRefreshResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/auth/session/revoke:
+    post:
+      operationId: revokeSession
+      tags: [Auth]
+      summary: Immediately revoke current, specified, or all user sessions and broadcast session_revoked sync event
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionRevokeRequest'
+      responses:
+        '200':
+          description: Session(s) revoked and committed to audit log.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionRevokeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/tenant/manifest:
+    get:
+      operationId: getTenantManifest
+      tags: [Tenant & Directory]
+      summary: Retrieve signed tenant security manifest, allowed cipher suites, escrow policy, and C2SP log keys
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+      responses:
+        '200':
+          description: Signed tenant manifest returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantManifestResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/users/directory:
+    get:
+      operationId: listUsersDirectory
+      tags: [Tenant & Directory]
+      summary: List verified tenant user public keys (UIK/UEK) with transparency log inclusion references
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+        - name: updated_after
+          in: query
+          required: false
+          description: Filter users updated strictly after this RFC 3339 UTC timestamp.
+          schema:
+            $ref: '#/components/schemas/IsoTimestamp'
+      responses:
+        '200':
+          description: Paginated tenant user public key directory.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsersDirectoryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/users/devices:
+    post:
+      operationId: registerUserDevice
+      tags: [Tenant & Directory]
+      summary: Register and attest a new hardware device identity key (HDIK) countersigned by UIK
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceRegistrationRequest'
+      responses:
+        '201':
+          description: Device registered and hardware attestation verified.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceRegistrationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/graph/my-edges:
+    get:
+      operationId: getMyGraphEdges
+      tags: [Key Graph]
+      summary: Retrieve all encrypted RBAC graph edges reachable by the authenticated user
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - name: since_revision
+          in: query
+          required: false
+          description: Optional monotonic graph revision number for delta retrieval.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        '200':
+          description: Encrypted graph nodes and wrapped key edges reachable by caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphSnapshotResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/graph/org:
+    get:
+      operationId: getOrgGraph
+      tags: [Key Graph]
+      summary: Retrieve complete tenant encrypted key-graph topology for Org Admin local decryption
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - name: since_revision
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        '200':
+          description: Full tenant encrypted DAG snapshot for authorized Org Admins.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphSnapshotResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/teams:
+    post:
+      operationId: createTeam
+      tags: [Key Graph]
+      summary: Create a team node at active_key_epoch=1 with initial signed KEM-wrapped TEK edges
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TeamCreateRequest'
+      responses:
+        '201':
+          description: Team created and initial edges committed atomically.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TeamCreateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/teams/{team_id}/rotate:
+    patch:
+      operationId: rotateTeamKeyEpoch
+      tags: [Key Graph]
+      summary: Atomically rotate Team Encryption Key (TEK) to expected_key_epoch + 1 with replacement edges
+      parameters:
+        - name: team_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EpochRotateRequest'
+      responses:
+        '200':
+          description: Team key epoch rotated atomically and epoch_rotated sync event emitted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EpochRotateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/collections:
+    post:
+      operationId: createCollection
+      tags: [Key Graph]
+      summary: Create a collection node at active_key_epoch=1 with initial signed KEM-wrapped CEK edges
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CollectionCreateRequest'
+      responses:
+        '201':
+          description: Collection created and initial edges committed atomically.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollectionCreateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/collections/{collection_id}/rotate:
+    patch:
+      operationId: rotateCollectionKeyEpoch
+      tags: [Key Graph]
+      summary: Atomically rotate Collection Encryption Key (CEK) to expected_key_epoch + 1
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EpochRotateRequest'
+      responses:
+        '200':
+          description: Collection key epoch rotated atomically and epoch_rotated sync event emitted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EpochRotateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/graph/edges:
+    post:
+      operationId: createGraphEdge
+      tags: [Key Graph]
+      summary: Insert a signed KEM-wrapped cryptographic RBAC graph edge (enforces DAG acyclicity and active key_epoch)
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignedWrappedEdgeInput'
+      responses:
+        '201':
+          description: Cryptographic edge inserted and committed to audit log.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeCreateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/graph/edges/{edge_id}:
+    delete:
+      operationId: deleteGraphEdge
+      tags: [Key Graph]
+      summary: Remove a cryptographic RBAC graph edge (epoch rotation recommended for forward secrecy)
+      parameters:
+        - name: edge_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      responses:
+        '200':
+          description: Graph edge removed and audited.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeDeleteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/collections/{collection_id}/items:
+    get:
+      operationId: listCollectionItems
+      tags: [Vault Items]
+      summary: List encrypted vault items in a collection with cursor pagination
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+        - name: include_deleted
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: updated_after
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/IsoTimestamp'
+      responses:
+        '200':
+          description: Paginated list of encrypted item envelopes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollectionItemsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    post:
+      operationId: createCollectionItem
+      tags: [Vault Items]
+      summary: Create an encrypted vault item bound to the collection's current active_key_epoch
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ItemCreateRequest'
+      responses:
+        '201':
+          description: Encrypted item created at version 1.
+          headers:
+            ETag:
+              description: Version ETag for optimistic concurrency (e.g., "v1").
+              schema:
+                type: string
+            X-RSV-Audit-Leaf-Index:
+              description: Monotonic C2SP audit log leaf index committing this mutation.
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemMutationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/items/{item_id}:
+    get:
+      operationId: getItem
+      tags: [Vault Items]
+      summary: Retrieve latest encrypted vault item envelope (audited read)
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+      responses:
+        '200':
+          description: Latest encrypted item envelope returned and read access committed to audit log.
+          headers:
+            ETag:
+              schema:
+                type: string
+            X-RSV-Audit-Leaf-Index:
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EncryptedItemRecord'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    put:
+      operationId: updateItem
+      tags: [Vault Items]
+      summary: Optimistically update encrypted vault item enforcing both If-Match version and collection active_key_epoch
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/IfMatchHeaderRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ItemUpdateRequest'
+      responses:
+        '200':
+          description: Item updated atomically; prior version archived in immutable revisions table.
+          headers:
+            ETag:
+              schema:
+                type: string
+            X-RSV-Audit-Leaf-Index:
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemMutationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    delete:
+      operationId: deleteItem
+      tags: [Vault Items]
+      summary: Soft-delete or purge an encrypted vault item with optimistic version verification
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [soft, purge]
+            default: soft
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - $ref: '#/components/parameters/IfMatchHeaderRequired'
+      responses:
+        '200':
+          description: Item deleted and audited.
+          headers:
+            X-RSV-Audit-Leaf-Index:
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemDeleteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/items/{item_id}/revisions:
+    get:
+      operationId: listItemRevisions
+      tags: [Vault Items]
+      summary: Retrieve paginated immutable revision history of encrypted item envelopes
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/CursorQuery'
+        - $ref: '#/components/parameters/LimitQuery'
+      responses:
+        '200':
+          description: Immutable historical ciphertext revisions returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ItemRevisionsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/recovery/ceremonies:
+    post:
+      operationId: executeRecoveryCeremonyAction
+      tags: [Recovery & Escrow]
+      summary: Initiate an M-of-N VSS recovery ceremony or submit a custodian's re-wrapped share contribution
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecoveryCeremonyActionRequest'
+      responses:
+        '200':
+          description: Custodian share recorded and ceremony status updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryCeremonyResponse'
+        '201':
+          description: New M-of-N recovery ceremony initiated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryCeremonyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/recovery/ceremonies/{ceremony_id}:
+    get:
+      operationId: getRecoveryCeremony
+      tags: [Recovery & Escrow]
+      summary: Inspect recovery ceremony state or release threshold shares once quorum M-of-N is met
+      parameters:
+        - name: ceremony_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - name: release_shares
+          in: query
+          required: false
+          description: When true, returns re-wrapped shares ONLY if collected_shares >= threshold_m (else 412 QUORUM_THRESHOLD_UNMET).
+          schema:
+            type: boolean
+            default: false
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+      responses:
+        '200':
+          description: Recovery ceremony details (and re-wrapped shares if release_shares=true and quorum met).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryCeremonyResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '412':
+          $ref: '#/components/responses/QuorumThresholdUnmet'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/recovery/escrow-bundle:
+    post:
+      operationId: uploadEscrowBundle
+      tags: [Recovery & Escrow]
+      summary: Upload verifiable M-of-N VSS escrow bundle validated against tenant escrow policy
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+        - $ref: '#/components/parameters/AuditEnvelopeHeaderRequired'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EscrowBundleUploadRequest'
+      responses:
+        '201':
+          description: VSS escrow bundle validated and persisted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EscrowBundleUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/audit/checkpoint:
+    get:
+      operationId: getAuditCheckpoint
+      tags: [Audit Log]
+      summary: Fetch latest C2SP signed-note transparency log checkpoint (Ed25519 + ML-DSA-65 cosigned)
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+      responses:
+        '200':
+          description: C2SP signed-note checkpoint payload.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: Canonical C2SP signed-note text containing origin, tree_size, base64 root hash, and Ed25519 + ML-DSA-65 signature lines.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/audit/tile/{level}/{index}:
+    get:
+      operationId: getAuditFullTile
+      tags: [Audit Log]
+      summary: Fetch complete immutable C2SP tlog-tiles Merkle tile (256 x 32-byte SHA-256 hashes = 8192 bytes)
+      parameters:
+        - name: level
+          in: path
+          required: true
+          description: Tile height level (0..63; each tile has height 8 -> 256 nodes).
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 63
+        - name: index
+          in: path
+          required: true
+          description: Tile index at the specified level (non-negative decimal or C2SP 3-digit grouped index).
+          schema:
+            type: string
+            pattern: '^(x[0-9]{3}/)*[0-9]+$'
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+      responses:
+        '200':
+          description: Exactly 8192 raw bytes representing 256 concatenated 32-byte SHA-256 hashes.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: public, max-age=31536000, immutable
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/audit/tile/{level}/{index}.p/{width}:
+    get:
+      operationId: getAuditPartialTile
+      tags: [Audit Log]
+      summary: Fetch rightmost partial C2SP tlog-tiles Merkle tile (width x 32-byte SHA-256 hashes, 1 <= width <= 255)
+      parameters:
+        - name: level
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 63
+        - name: index
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^(x[0-9]{3}/)*[0-9]+$'
+        - name: width
+          in: path
+          required: true
+          description: Number of populated 32-byte hash entries in this partial tile.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 255
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+      responses:
+        '200':
+          description: Exactly width * 32 raw bytes of SHA-256 node hashes.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-cache
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/audit/entries/{index}:
+    get:
+      operationId: getAuditEntry
+      tags: [Audit Log]
+      summary: Fetch immutable signed deterministic CBOR audit log entry at leaf index
+      parameters:
+        - name: index
+          in: path
+          required: true
+          description: Zero-based leaf index in the tenant's C2SP transparency log.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - $ref: '#/components/parameters/RequestSignatureHeader'
+      responses:
+        '200':
+          description: Immutable deterministic CBOR audit entry and verified leaf hash.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: public, max-age=31536000, immutable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEntryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /api/v1/sync/stream:
+    get:
+      operationId: connectSyncStream
+      tags: [Sync Stream]
+      summary: Real-time opaque vault synchronization stream (WebSocket rsv-sync.v1 primary, SSE fallback)
+      description: |
+        Upgrades to WebSocket subprotocol `rsv-sync.v1` when `Upgrade: websocket` is supplied, or opens a Server-Sent Events (`text/event-stream`) stream when `Accept: text/event-stream` is supplied.
+        Native clients authenticate via standard HTTP headers (`Authorization`, `X-RSV-Tenant-Id`, `X-RSV-Device-Id`, `X-RSV-Request-Signature`); browser WebSocket clients MUST send a `SyncClientAuthFrame` as their first frame within 5 seconds of connect (never passing tokens in URL query parameters).
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque resume cursor returned in prior sync events (used for SSE or header-authenticated WebSocket upgrade).
+          schema:
+            $ref: '#/components/schemas/Base64Url'
+        - name: X-RSV-Tenant-Id
+          in: header
+          required: false
+          description: Required on SSE and native WebSocket upgrades (supplied in first WebSocket authenticate frame for browsers).
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - name: X-RSV-Device-Id
+          in: header
+          required: false
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - name: X-RSV-Request-Signature
+          in: header
+          required: false
+          schema:
+            $ref: '#/components/schemas/RequestSignatureValue'
+      responses:
+        '101':
+          description: Switching Protocols to WebSocket subprotocol `rsv-sync.v1`.
+          headers:
+            Sec-WebSocket-Protocol:
+              schema:
+                type: string
+                const: rsv-sync.v1
+        '200':
+          description: Server-Sent Events (`text/event-stream`) opaque synchronization stream.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/SyncServerFrame'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/TenantMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived signed session token bound to `(tenant_id, user_id, device_id, session_id)` paired with `X-RSV-Request-Signature`.
+    MutualTLS:
+      type: mutualTLS
+      description: Optional enterprise device client certificate authentication enforced when `tenant/manifest.mtls_required` is true.
+
+  parameters:
+    TenantIdHeader:
+      name: X-RSV-Tenant-Id
+      in: header
+      required: true
+      description: Canonical lowercase UUIDv7 tenant identifier enforced against JWT `tid` claim and PostgreSQL RLS.
+      schema:
+        $ref: '#/components/schemas/UuidV7'
+    DeviceIdHeader:
+      name: X-RSV-Device-Id
+      in: header
+      required: true
+      description: Canonical lowercase UUIDv7 registered device identifier bound to `HDIK`.
+      schema:
+        $ref: '#/components/schemas/UuidV7'
+    RequestSignatureHeader:
+      name: X-RSV-Request-Signature
+      in: header
+      required: true
+      description: Canonical hybrid request signature covering method, normalized path, sorted query, tenant_id, device_id, ts, nonce, SHA-256(body), and SHA-256(decoded audit envelope).
+      schema:
+        $ref: '#/components/schemas/RequestSignatureValue'
+    AuditEnvelopeHeaderRequired:
+      name: X-RSV-Audit-Envelope
+      in: header
+      required: true
+      description: Unpadded Base64URL-encoded RFC 8949 deterministic CBOR signed client AuditEnvelope.
+      schema:
+        $ref: '#/components/schemas/Base64Url'
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUIDv7/UUIDv4 deduplication token scoped for 24 hours.
+      schema:
+        type: string
+        format: uuid
+    IfMatchHeaderRequired:
+      name: If-Match
+      in: header
+      required: true
+      description: Quoted version ETag matching expected item version (e.g. `"v4"`).
+      schema:
+        type: string
+        pattern: '^"v[1-9][0-9]*"$'
+    CursorQuery:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor token returned by a previous page.
+      schema:
+        $ref: '#/components/schemas/Base64Url'
+    LimitQuery:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+
+  responses:
+    BadRequest:
+      description: Malformed request, missing mandatory `X-RSV-Audit-Envelope`, or unsupported cipher suite.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Invalid or expired bearer token, failed `X-RSV-Request-Signature` verification, replay detected, or revoked device.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    TenantMismatch:
+      description: Tenant isolation violation (`TENANT_MISMATCH`) or insufficient authorization.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Target resource does not exist within caller's authorized tenant scope.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Optimistic concurrency mismatch (`VERSION_CONFLICT`) or stale key epoch (`STALE_KEY_EPOCH`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    QuorumThresholdUnmet:
+      description: Recovery ceremony has fewer custodian shares than `threshold_m` (`QUORUM_THRESHOLD_UNMET`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnprocessableEntity:
+      description: Cryptographic or policy invariant failed (`GRAPH_CYCLE_REJECTED`, `ESCROW_POLICY_VIOLATION`, `DEVICE_ATTESTATION_FAILED`, `AUDIT_COMMITMENT_INVALID`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimited:
+      description: Sliding-window rate limit exceeded (`RATE_LIMITED`).
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      examples:
+        - 01934567-89ab-7cde-8f01-23456789abcd
+
+    Base64Url:
+      type: string
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: Unpadded RFC 4648 Section 5 Base64URL string.
+
+    IsoTimestamp:
+      type: string
+      format: date-time
+      examples:
+        - '2026-11-19T19:30:00.000Z'
+
+    CipherSuite:
+      type: string
+      enum:
+        - RSV-HYBRID-2026-V1
+        - RSV-HYBRID-FIPS-2026-V1
+
+    RequestSignatureValue:
+      type: string
+      pattern: '^v=1; kid=[0-9a-f-]{36}; signer=(hdik|uik); suite=(RSV-HYBRID-2026-V1|RSV-HYBRID-FIPS-2026-V1); ts=[0-9]{13,16}; nonce=[A-Za-z0-9_-]{22}; sig=[A-Za-z0-9_-]+$'
+
+    ErrorCode:
+      type: string
+      enum:
+        - TENANT_MISMATCH
+        - INVALID_SIGNATURE
+        - MISSING_AUDIT_ENVELOPE
+        - STALE_KEY_EPOCH
+        - VERSION_CONFLICT
+        - GRAPH_CYCLE_REJECTED
+        - ESCROW_POLICY_VIOLATION
+        - UNSUPPORTED_CIPHER_SUITE
+        - DEVICE_ATTESTATION_FAILED
+        - RATE_LIMITED
+        - QUORUM_THRESHOLD_UNMET
+        - AUDIT_COMMITMENT_INVALID
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id, retryable]
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            message:
+              type: string
+            request_id:
+              $ref: '#/components/schemas/UuidV7'
+            retryable:
+              type: boolean
+            retry_after_ms:
+              type: ['integer', 'null']
+              minimum: 0
+            details:
+              type: ['object', 'null']
+              additionalProperties: true
+
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status, version, api_version, supported_cipher_suites, tls_pq_enabled, server_time]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+        api_version:
+          type: string
+          const: v1
+        supported_cipher_suites:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CipherSuite'
+        tls_pq_enabled:
+          type: boolean
+        server_time:
+          $ref: '#/components/schemas/IsoTimestamp'
+
+    KdfMetadata:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [webauthn_prf_v1, argon2id_v1]
+        prf_salt_nonce:
+          type: ['string', 'null']
+          pattern: '^[A-Za-z0-9_-]+$'
+        argon2_memory_kib:
+          type: ['integer', 'null']
+          minimum: 65536
+        argon2_iterations:
+          type: ['integer', 'null']
+          minimum: 3
+        argon2_parallelism:
+          type: ['integer', 'null']
+          minimum: 1
+
+    WebAuthnRegisterStartRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, email, display_name]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/UuidV7'
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        enrollment_token:
+          type: ['string', 'null']
+
+    WebAuthnRegisterStartResponse:
+      type: object
+      additionalProperties: false
+      required: [ceremony_id, public_key_credential_creation_options, prf_salt_v1]
+      properties:
+        ceremony_id:
+          $ref: '#/components/schemas/UuidV7'
+        public_key_credential_creation_options:
+          type: object
+          additionalProperties: true
+        prf_salt_v1:
+          $ref: '#/components/schemas/Base64Url'
+
+    WebAuthnRegisterFinishRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - ceremony_id
+        - attestation_response
+        - cipher_suite
+        - uik_public_key
+        - uek_public_key
+        - encrypted_umk_bundle
+        - encrypted_uik_bundle
+        - encrypted_uek_bundle
+        - kdf_metadata
+      properties:
+        ceremony_id:
+          $ref: '#/components/schemas/UuidV7'
+        attestation_response:
+          type: object
+          additionalProperties: true
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        uik_public_key:
+          $ref: '#/components/schemas/Base64Url'
+        uek_public_key:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_umk_bundle:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_uik_bundle:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_uek_bundle:
+          $ref: '#/components/schemas/Base64Url'
+        kdf_metadata:
+          $ref: '#/components/schemas/KdfMetadata'
+
+    WebAuthnRegisterFinishResponse:
+      type: object
+      additionalProperties: false
+      required: [user_id, credential_id, uik_key_id, uek_key_id, audit_leaf_index]
+      properties:
+        user_id:
+          $ref: '#/components/schemas/UuidV7'
+        credential_id:
+          $ref: '#/components/schemas/Base64Url'
+        uik_key_id:
+          $ref: '#/components/schemas/UuidV7'
+        uek_key_id:
+          $ref: '#/components/schemas/UuidV7'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    WebAuthnLoginStartRequest:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, user_identifier]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/UuidV7'
+        user_identifier:
+          type: string
+          minLength: 1
+          maxLength: 256
+        device_id:
+          oneOf:
+            - $ref: '#/components/schemas/UuidV7'
+            - type: 'null'
+
+    WebAuthnLoginStartResponse:
+      type: object
+      additionalProperties: false
+      required: [ceremony_id, public_key_credential_request_options, prf_salt_v1, kdf_metadata]
+      properties:
+        ceremony_id:
+          $ref: '#/components/schemas/UuidV7'
+        public_key_credential_request_options:
+          type: object
+          additionalProperties: true
+        prf_salt_v1:
+          $ref: '#/components/schemas/Base64Url'
+        kdf_metadata:
+          $ref: '#/components/schemas/KdfMetadata'
+
+    WebAuthnLoginFinishRequest:
+      type: object
+      additionalProperties: false
+      required: [ceremony_id, assertion_response]
+      properties:
+        ceremony_id:
+          $ref: '#/components/schemas/UuidV7'
+        assertion_response:
+          type: object
+          additionalProperties: true
+        device_id:
+          oneOf:
+            - $ref: '#/components/schemas/UuidV7'
+            - type: 'null'
+
+    WebAuthnLoginFinishResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - access_token
+        - access_token_expires_in
+        - refresh_token
+        - session_id
+        - user_id
+        - device_id
+        - cipher_suite
+        - encrypted_umk_bundle
+        - encrypted_uik_bundle
+        - encrypted_uek_bundle
+      properties:
+        access_token:
+          type: string
+        access_token_expires_in:
+          type: integer
+          minimum: 60
+          maximum: 900
+        refresh_token:
+          $ref: '#/components/schemas/Base64Url'
+        session_id:
+          $ref: '#/components/schemas/UuidV7'
+        user_id:
+          $ref: '#/components/schemas/UuidV7'
+        device_id:
+          $ref: '#/components/schemas/UuidV7'
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        encrypted_umk_bundle:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_uik_bundle:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_uek_bundle:
+          $ref: '#/components/schemas/Base64Url'
+
+    SessionRefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          $ref: '#/components/schemas/Base64Url'
+
+    SessionRefreshResponse:
+      type: object
+      additionalProperties: false
+      required: [access_token, access_token_expires_in, refresh_token, session_id]
+      properties:
+        access_token:
+          type: string
+        access_token_expires_in:
+          type: integer
+          minimum: 60
+          maximum: 900
+        refresh_token:
+          $ref: '#/components/schemas/Base64Url'
+        session_id:
+          $ref: '#/components/schemas/UuidV7'
+
+    SessionRevokeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        session_id:
+          oneOf:
+            - $ref: '#/components/schemas/UuidV7'
+            - type: 'null'
+        revoke_all_user_sessions:
+          type: boolean
+          default: false
+
+    SessionRevokeResponse:
+      type: object
+      additionalProperties: false
+      required: [revoked_session_ids, revoked_at, audit_leaf_index]
+      properties:
+        revoked_session_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/UuidV7'
+        revoked_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    EscrowPolicy:
+      type: object
+      additionalProperties: false
+      required: [required, min_threshold_m, min_custodians_n, custodian_user_ids]
+      properties:
+        required:
+          type: boolean
+        min_threshold_m:
+          type: integer
+          minimum: 1
+          maximum: 32
+        min_custodians_n:
+          type: integer
+          minimum: 1
+          maximum: 64
+        custodian_user_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/UuidV7'
+
+    TenantManifestResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - tenant_id
+        - manifest_version
+        - signed_manifest_cbor
+        - allowed_cipher_suites
+        - require_hardware_attestation
+        - allow_standalone_extension_wasm
+        - mtls_required
+        - escrow_policy
+        - audit_log_origin
+        - audit_log_public_keys
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/UuidV7'
+        manifest_version:
+          type: integer
+          minimum: 1
+        signed_manifest_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        allowed_cipher_suites:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CipherSuite'
+        require_hardware_attestation:
+          type: boolean
+        allow_standalone_extension_wasm:
+          type: boolean
+        mtls_required:
+          type: boolean
+        escrow_policy:
+          $ref: '#/components/schemas/EscrowPolicy'
+        audit_log_origin:
+          type: string
+        audit_log_public_keys:
+          type: object
+          additionalProperties: false
+          required: [ed25519, mldsa65]
+          properties:
+            ed25519:
+              $ref: '#/components/schemas/Base64Url'
+            mldsa65:
+              $ref: '#/components/schemas/Base64Url'
+
+    DirectoryUserRecord:
+      type: object
+      additionalProperties: false
+      required:
+        - user_id
+        - handle
+        - status
+        - uik_key_id
+        - uik_public_key
+        - uek_key_id
+        - uek_public_key
+        - cipher_suite
+        - audit_leaf_index
+        - key_proof_cbor
+      properties:
+        user_id:
+          $ref: '#/components/schemas/UuidV7'
+        handle:
+          type: string
+        status:
+          type: string
+          enum: [active, suspended, offboarded]
+        uik_key_id:
+          $ref: '#/components/schemas/UuidV7'
+        uik_public_key:
+          $ref: '#/components/schemas/Base64Url'
+        uek_key_id:
+          $ref: '#/components/schemas/UuidV7'
+        uek_public_key:
+          $ref: '#/components/schemas/Base64Url'
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+        key_proof_cbor:
+          $ref: '#/components/schemas/Base64Url'
+
+    UsersDirectoryResponse:
+      type: object
+      additionalProperties: false
+      required: [users, next_cursor]
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/DirectoryUserRecord'
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - type: 'null'
+
+    DeviceRegistrationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - device_label
+        - platform
+        - cipher_suite
+        - hdik_public_key
+        - attestation_format
+        - attestation_payload_cbor
+        - uik_countersignature
+      properties:
+        device_label:
+          type: string
+          minLength: 1
+          maxLength: 128
+        platform:
+          type: string
+          enum: [macos, windows, linux, web_wasm]
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        hdik_public_key:
+          $ref: '#/components/schemas/Base64Url'
+        attestation_format:
+          type: string
+          enum: [apple_secure_enclave, tpm2_ek_ak, fido2_packed, none]
+        attestation_payload_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        uik_countersignature:
+          $ref: '#/components/schemas/Base64Url'
+
+    DeviceRegistrationResponse:
+      type: object
+      additionalProperties: false
+      required: [device_id, hdik_key_id, attested, registered_at, audit_leaf_index]
+      properties:
+        device_id:
+          $ref: '#/components/schemas/UuidV7'
+        hdik_key_id:
+          $ref: '#/components/schemas/UuidV7'
+        attested:
+          type: boolean
+        registered_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    GraphNodeType:
+      type: string
+      enum: [org, team, collection, user]
+
+    GraphEdgeRole:
+      type: string
+      enum: [reader, writer, admin]
+
+    GraphNode:
+      type: object
+      additionalProperties: false
+      required: [node_id, node_type, active_key_epoch, encrypted_metadata_cbor, updated_at]
+      properties:
+        node_id:
+          $ref: '#/components/schemas/UuidV7'
+        node_type:
+          $ref: '#/components/schemas/GraphNodeType'
+        active_key_epoch:
+          type: integer
+          minimum: 1
+        encrypted_metadata_cbor:
+          oneOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - type: 'null'
+        updated_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+
+    SignedWrappedEdgeInput:
+      type: object
+      additionalProperties: false
+      required:
+        - source_node_id
+        - target_node_id
+        - role
+        - key_epoch
+        - cipher_suite
+        - wrapped_key_cbor
+        - edge_signature
+      properties:
+        source_node_id:
+          $ref: '#/components/schemas/UuidV7'
+        target_node_id:
+          $ref: '#/components/schemas/UuidV7'
+        role:
+          $ref: '#/components/schemas/GraphEdgeRole'
+        key_epoch:
+          type: integer
+          minimum: 1
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        wrapped_key_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        edge_signature:
+          $ref: '#/components/schemas/Base64Url'
+
+    SignedWrappedEdge:
+      type: object
+      additionalProperties: false
+      required:
+        - edge_id
+        - source_node_id
+        - source_node_type
+        - target_node_id
+        - target_node_type
+        - role
+        - key_epoch
+        - cipher_suite
+        - wrapped_key_cbor
+        - signer_user_id
+        - edge_signature
+        - created_at
+      properties:
+        edge_id:
+          $ref: '#/components/schemas/UuidV7'
+        source_node_id:
+          $ref: '#/components/schemas/UuidV7'
+        source_node_type:
+          $ref: '#/components/schemas/GraphNodeType'
+        target_node_id:
+          $ref: '#/components/schemas/UuidV7'
+        target_node_type:
+          $ref: '#/components/schemas/GraphNodeType'
+        role:
+          $ref: '#/components/schemas/GraphEdgeRole'
+        key_epoch:
+          type: integer
+          minimum: 1
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        wrapped_key_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        signer_user_id:
+          $ref: '#/components/schemas/UuidV7'
+        edge_signature:
+          $ref: '#/components/schemas/Base64Url'
+        created_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+
+    GraphSnapshotResponse:
+      type: object
+      additionalProperties: false
+      required: [graph_revision, nodes, edges]
+      properties:
+        graph_revision:
+          type: integer
+          format: int64
+          minimum: 0
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignedWrappedEdge'
+
+    TeamCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [team_id, parent_node_id, encrypted_metadata_cbor, cipher_suite, initial_edges]
+      properties:
+        team_id:
+          $ref: '#/components/schemas/UuidV7'
+        parent_node_id:
+          $ref: '#/components/schemas/UuidV7'
+        encrypted_metadata_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        initial_edges:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SignedWrappedEdgeInput'
+
+    TeamCreateResponse:
+      type: object
+      additionalProperties: false
+      required: [team_id, active_key_epoch, created_edge_ids, audit_leaf_index]
+      properties:
+        team_id:
+          $ref: '#/components/schemas/UuidV7'
+        active_key_epoch:
+          type: integer
+          const: 1
+        created_edge_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/UuidV7'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    CollectionCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [collection_id, parent_node_id, encrypted_metadata_cbor, cipher_suite, initial_edges]
+      properties:
+        collection_id:
+          $ref: '#/components/schemas/UuidV7'
+        parent_node_id:
+          $ref: '#/components/schemas/UuidV7'
+        encrypted_metadata_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        initial_edges:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SignedWrappedEdgeInput'
+
+    CollectionCreateResponse:
+      type: object
+      additionalProperties: false
+      required: [collection_id, active_key_epoch, created_edge_ids, audit_leaf_index]
+      properties:
+        collection_id:
+          $ref: '#/components/schemas/UuidV7'
+        active_key_epoch:
+          type: integer
+          const: 1
+        created_edge_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/UuidV7'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    EpochRotateRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_key_epoch, new_key_epoch, cipher_suite, replacement_edges]
+      properties:
+        expected_key_epoch:
+          type: integer
+          minimum: 1
+        new_key_epoch:
+          type: integer
+          minimum: 2
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        replacement_edges:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SignedWrappedEdgeInput'
+        revoked_edge_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/UuidV7'
+          default: []
+        encrypted_metadata_cbor:
+          oneOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - type: 'null'
+
+    EpochRotateResponse:
+      type: object
+      additionalProperties: false
+      required: [node_id, active_key_epoch, active_edge_count, audit_leaf_index]
+      properties:
+        node_id:
+          $ref: '#/components/schemas/UuidV7'
+        active_key_epoch:
+          type: integer
+          minimum: 2
+        active_edge_count:
+          type: integer
+          minimum: 1
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    EdgeCreateResponse:
+      type: object
+      additionalProperties: false
+      required: [edge_id, key_epoch, audit_leaf_index]
+      properties:
+        edge_id:
+          $ref: '#/components/schemas/UuidV7'
+        key_epoch:
+          type: integer
+          minimum: 1
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    EdgeDeleteResponse:
+      type: object
+      additionalProperties: false
+      required: [edge_id, deleted, rotation_recommended, audit_leaf_index]
+      properties:
+        edge_id:
+          $ref: '#/components/schemas/UuidV7'
+        deleted:
+          type: boolean
+          const: true
+        rotation_recommended:
+          type: boolean
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    EncryptedItemRecord:
+      type: object
+      additionalProperties: false
+      required:
+        - item_id
+        - collection_id
+        - version
+        - key_epoch
+        - cipher_suite
+        - wrapped_iek_cbor
+        - encrypted_payload_cbor
+        - deleted
+        - etag
+        - created_at
+        - updated_at
+      properties:
+        item_id:
+          $ref: '#/components/schemas/UuidV7'
+        collection_id:
+          $ref: '#/components/schemas/UuidV7'
+        version:
+          type: integer
+          minimum: 1
+        key_epoch:
+          type: integer
+          minimum: 1
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        wrapped_iek_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_payload_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        deleted:
+          type: boolean
+        etag:
+          type: string
+        created_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        updated_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+
+    CollectionItemsResponse:
+      type: object
+      additionalProperties: false
+      required: [collection_id, active_key_epoch, items, next_cursor]
+      properties:
+        collection_id:
+          $ref: '#/components/schemas/UuidV7'
+        active_key_epoch:
+          type: integer
+          minimum: 1
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EncryptedItemRecord'
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - type: 'null'
+
+    ItemCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [item_id, key_epoch, cipher_suite, wrapped_iek_cbor, encrypted_payload_cbor]
+      properties:
+        item_id:
+          $ref: '#/components/schemas/UuidV7'
+        key_epoch:
+          type: integer
+          minimum: 1
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        wrapped_iek_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_payload_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        blind_index_tokens:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/Base64Url'
+
+    ItemUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_version, key_epoch, cipher_suite, wrapped_iek_cbor, encrypted_payload_cbor]
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+        key_epoch:
+          type: integer
+          minimum: 1
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        wrapped_iek_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_payload_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        blind_index_tokens:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/Base64Url'
+
+    ItemMutationResponse:
+      type: object
+      additionalProperties: false
+      required: [item_id, collection_id, version, key_epoch, etag, updated_at, audit_leaf_index]
+      properties:
+        item_id:
+          $ref: '#/components/schemas/UuidV7'
+        collection_id:
+          $ref: '#/components/schemas/UuidV7'
+        version:
+          type: integer
+          minimum: 1
+        key_epoch:
+          type: integer
+          minimum: 1
+        etag:
+          type: string
+        updated_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ItemDeleteResponse:
+      type: object
+      additionalProperties: false
+      required: [item_id, version, deleted, mode, audit_leaf_index]
+      properties:
+        item_id:
+          $ref: '#/components/schemas/UuidV7'
+        version:
+          type: integer
+          minimum: 1
+        deleted:
+          type: boolean
+          const: true
+        mode:
+          type: string
+          enum: [soft, purge]
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ItemRevisionRecord:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - key_epoch
+        - cipher_suite
+        - wrapped_iek_cbor
+        - encrypted_payload_cbor
+        - actor_user_id
+        - created_at
+        - audit_leaf_index
+      properties:
+        version:
+          type: integer
+          minimum: 1
+        key_epoch:
+          type: integer
+          minimum: 1
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        wrapped_iek_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_payload_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        actor_user_id:
+          $ref: '#/components/schemas/UuidV7'
+        created_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ItemRevisionsResponse:
+      type: object
+      additionalProperties: false
+      required: [item_id, revisions, next_cursor]
+      properties:
+        item_id:
+          $ref: '#/components/schemas/UuidV7'
+        revisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItemRevisionRecord'
+        next_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - type: 'null'
+
+    EncryptedEscrowShare:
+      type: object
+      additionalProperties: false
+      required: [share_index, custodian_user_id, wrapped_share_cbor]
+      properties:
+        share_index:
+          type: integer
+          minimum: 1
+          maximum: 64
+        custodian_user_id:
+          $ref: '#/components/schemas/UuidV7'
+        wrapped_share_cbor:
+          $ref: '#/components/schemas/Base64Url'
+
+    EscrowBundleUploadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - escrow_id
+        - subject_user_id
+        - escrow_epoch
+        - cipher_suite
+        - threshold_m
+        - total_shares_n
+        - vss_commitments_cbor
+        - encrypted_shares
+        - bundle_signature
+      properties:
+        escrow_id:
+          $ref: '#/components/schemas/UuidV7'
+        subject_user_id:
+          $ref: '#/components/schemas/UuidV7'
+        escrow_epoch:
+          type: integer
+          minimum: 1
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        threshold_m:
+          type: integer
+          minimum: 1
+          maximum: 32
+        total_shares_n:
+          type: integer
+          minimum: 1
+          maximum: 64
+        vss_commitments_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        encrypted_shares:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/EncryptedEscrowShare'
+        bundle_signature:
+          $ref: '#/components/schemas/Base64Url'
+
+    EscrowBundleUploadResponse:
+      type: object
+      additionalProperties: false
+      required: [escrow_id, escrow_epoch, threshold_m, total_shares_n, audit_leaf_index]
+      properties:
+        escrow_id:
+          $ref: '#/components/schemas/UuidV7'
+        escrow_epoch:
+          type: integer
+          minimum: 1
+        threshold_m:
+          type: integer
+        total_shares_n:
+          type: integer
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    RecoveryCeremonyInitiateRequest:
+      type: object
+      additionalProperties: false
+      required: [action, escrow_id, ephemeral_recovery_uek_public_key, cipher_suite, reason_code]
+      properties:
+        action:
+          type: string
+          const: initiate
+        escrow_id:
+          $ref: '#/components/schemas/UuidV7'
+        ephemeral_recovery_uek_public_key:
+          $ref: '#/components/schemas/Base64Url'
+        cipher_suite:
+          $ref: '#/components/schemas/CipherSuite'
+        reason_code:
+          type: string
+          enum: [device_loss, passkey_loss, enterprise_audit_recovery]
+
+    RecoveryCeremonySubmitShareRequest:
+      type: object
+      additionalProperties: false
+      required: [action, ceremony_id, share_index, rewrapped_share_cbor, custodian_signature]
+      properties:
+        action:
+          type: string
+          const: submit_share
+        ceremony_id:
+          $ref: '#/components/schemas/UuidV7'
+        share_index:
+          type: integer
+          minimum: 1
+          maximum: 64
+        rewrapped_share_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        custodian_signature:
+          $ref: '#/components/schemas/Base64Url'
+
+    RecoveryCeremonyActionRequest:
+      oneOf:
+        - $ref: '#/components/schemas/RecoveryCeremonyInitiateRequest'
+        - $ref: '#/components/schemas/RecoveryCeremonySubmitShareRequest'
+      discriminator:
+        propertyName: action
+        mapping:
+          initiate: '#/components/schemas/RecoveryCeremonyInitiateRequest'
+          submit_share: '#/components/schemas/RecoveryCeremonySubmitShareRequest'
+
+    ReleasedRecoveryShare:
+      type: object
+      additionalProperties: false
+      required: [share_index, custodian_user_id, rewrapped_share_cbor, custodian_signature, submitted_at]
+      properties:
+        share_index:
+          type: integer
+          minimum: 1
+          maximum: 64
+        custodian_user_id:
+          $ref: '#/components/schemas/UuidV7'
+        rewrapped_share_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        custodian_signature:
+          $ref: '#/components/schemas/Base64Url'
+        submitted_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+
+    RecoveryCeremonyResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - ceremony_id
+        - escrow_id
+        - status
+        - threshold_m
+        - total_shares_n
+        - collected_shares
+        - vss_commitments_cbor
+        - ephemeral_recovery_uek_public_key
+        - created_at
+        - expires_at
+        - audit_leaf_index
+      properties:
+        ceremony_id:
+          $ref: '#/components/schemas/UuidV7'
+        escrow_id:
+          $ref: '#/components/schemas/UuidV7'
+        status:
+          type: string
+          enum: [pending_quorum, quorum_met, completed, expired, cancelled]
+        threshold_m:
+          type: integer
+          minimum: 1
+        total_shares_n:
+          type: integer
+          minimum: 1
+        collected_shares:
+          type: integer
+          minimum: 0
+        vss_commitments_cbor:
+          $ref: '#/components/schemas/Base64Url'
+        ephemeral_recovery_uek_public_key:
+          $ref: '#/components/schemas/Base64Url'
+        released_shares:
+          type: ['array', 'null']
+          items:
+            $ref: '#/components/schemas/ReleasedRecoveryShare'
+        created_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        expires_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        audit_leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+
+    AuditEntryResponse:
+      type: object
+      additionalProperties: false
+      required: [leaf_index, leaf_hash, recorded_at, audit_envelope_cbor]
+      properties:
+        leaf_index:
+          type: integer
+          format: int64
+          minimum: 0
+        leaf_hash:
+          $ref: '#/components/schemas/Base64Url'
+        recorded_at:
+          $ref: '#/components/schemas/IsoTimestamp'
+        audit_envelope_cbor:
+          $ref: '#/components/schemas/Base64Url'
+
+    SyncEventType:
+      type: string
+      enum:
+        - item_upserted
+        - item_deleted
+        - edge_granted
+        - edge_revoked
+        - epoch_rotated
+        - recovery_ceremony_updated
+        - audit_checkpoint_advanced
+        - session_revoked
+
+    SyncClientFrame:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, tenant_id, device_id, access_token, request_signature]
+          properties:
+            type:
+              type: string
+              const: authenticate
+            tenant_id:
+              $ref: '#/components/schemas/UuidV7'
+            device_id:
+              $ref: '#/components/schemas/UuidV7'
+            access_token:
+              type: string
+            request_signature:
+              $ref: '#/components/schemas/RequestSignatureValue'
+            resume_cursor:
+              oneOf:
+                - $ref: '#/components/schemas/Base64Url'
+                - type: 'null'
+        - type: object
+          additionalProperties: false
+          required: [type, cursor]
+          properties:
+            type:
+              type: string
+              const: ack
+            cursor:
+              $ref: '#/components/schemas/Base64Url'
+        - type: object
+          additionalProperties: false
+          required: [type, ts]
+          properties:
+            type:
+              type: string
+              const: ping
+            ts:
+              type: integer
+              format: int64
+
+    SyncServerFrame:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [type, session_id, current_cursor, heartbeat_interval_ms]
+          properties:
+            type:
+              type: string
+              const: authenticated
+            session_id:
+              $ref: '#/components/schemas/UuidV7'
+            current_cursor:
+              $ref: '#/components/schemas/Base64Url'
+            heartbeat_interval_ms:
+              type: integer
+              minimum: 5000
+              maximum: 60000
+        - type: object
+          additionalProperties: false
+          required: [type, cursor, event_id, event_type, occurred_at, payload]
+          properties:
+            type:
+              type: string
+              const: event
+            cursor:
+              $ref: '#/components/schemas/Base64Url'
+            event_id:
+              $ref: '#/components/schemas/UuidV7'
+            event_type:
+              $ref: '#/components/schemas/SyncEventType'
+            occurred_at:
+              $ref: '#/components/schemas/IsoTimestamp'
+            payload:
+              type: object
+              additionalProperties: true
+        - type: object
+          additionalProperties: false
+          required: [type, ts]
+          properties:
+            type:
+              type: string
+              const: pong
+            ts:
+              type: integer
+              format: int64
+        - type: object
+          additionalProperties: false
+          required: [type, reason, min_available_cursor]
+          properties:
+            type:
+              type: string
+              const: resync_required
+            reason:
+              type: string
+              enum: [cursor_expired, backpressure_overflow, graph_epoch_reset]
+            min_available_cursor:
+              $ref: '#/components/schemas/Base64Url'

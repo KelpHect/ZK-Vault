@@ -1,0 +1,795 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rusticstack.io/schemas/ipc-native-messaging-v1.schema.json",
+  "title": "RusticStack Core (ZK-Vault) Chrome Native Messaging Chunked IPC Protocol v1",
+  "description": "Normative JSON Schema (Draft 2020-12) for the chunked, HPKE/X25519-encrypted IPC protocol between the RusticStack Chrome Extension (MV3) and rsv-daemon via rsv-nm-host. Enforces max_chunk_bytes = 786432 (768 KiB) so every Native Host -> Extension 32-bit length-prefixed JSON frame stays deterministically below Chrome's hard 1 MiB (1,048,576-byte) termination limit.",
+  "$ref": "#/$defs/ChunkEnvelope",
+  "$defs": {
+    "UuidV7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Canonical lowercase RFC 9562 UUIDv7 identifier."
+    },
+    "Base64Url": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "Unpadded RFC 4648 Section 5 Base64URL string."
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase 64-character hex-encoded SHA-256 digest."
+    },
+    "ChromeExtensionId": {
+      "type": "string",
+      "pattern": "^[a-p]{32}$",
+      "description": "Canonical 32-character Chrome Extension ID pinned in OS native messaging manifest allowed_origins."
+    },
+    "HttpsOrLoopbackOrigin": {
+      "type": "string",
+      "pattern": "^(https://[^\\s/]+|http://(localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]{1,5})?)$",
+      "maxLength": 2048,
+      "description": "Verified tab/frame origin (scheme + canonical Punycode host + optional explicit port) obtained from privileged Chrome extension APIs."
+    },
+    "ChunkEnvelope": {
+      "type": "object",
+      "description": "Top-level wire envelope framed by Chrome Native Messaging's 32-bit native-endian length prefix. Total serialized UTF-8 JSON MUST NOT exceed 851,968 bytes (832 KiB) to remain safely below Chrome's 1,048,576-byte Host -> Extension ceiling.",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "frame_id",
+        "chunk_index",
+        "total_chunks",
+        "max_chunk_bytes",
+        "payload_encoding",
+        "payload_chunk"
+      ],
+      "properties": {
+        "protocol_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "frame_id": {
+          "$ref": "#/$defs/UuidV7",
+          "description": "Unique logical message identifier shared by all chunks belonging to one logical message."
+        },
+        "chunk_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63,
+          "description": "Zero-based sequence index of this chunk (MUST satisfy 0 <= chunk_index < total_chunks)."
+        },
+        "total_chunks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Total number of chunks comprising this logical message (max 64 chunks = 48 MiB logical ceiling)."
+        },
+        "max_chunk_bytes": {
+          "type": "integer",
+          "const": 786432,
+          "description": "Normative chunk payload ceiling (768 KiB = 786,432 bytes), leaving > 260 KiB headroom below Chrome's 1 MiB Native Messaging cap."
+        },
+        "payload_encoding": {
+          "type": "string",
+          "enum": [
+            "handshake_json_b64url",
+            "hpke_chacha20poly1305_b64url"
+          ],
+          "description": "handshake_json_b64url is permitted ONLY for HandshakeInit / HandshakeComplete / fatal unencrypted IpcError frames; all post-handshake IPC MUST use hpke_chacha20poly1305_b64url."
+        },
+        "channel_seq": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Monotonically increasing per-direction 64-bit AEAD nonce sequence counter (mandatory when payload_encoding == hpke_chacha20poly1305_b64url)."
+        },
+        "payload_chunk": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]*$",
+          "maxLength": 786432,
+          "description": "Chunk slice of the base64url-encoded logical frame payload, strictly <= 786,432 UTF-8 bytes."
+        },
+        "total_payload_sha256": {
+          "oneOf": [
+            { "$ref": "#/$defs/Sha256Hex" },
+            { "type": "null" }
+          ],
+          "description": "SHA-256 digest of the complete reassembled payload bytes; MUST be populated on chunk_index == 0 when total_chunks > 1."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "payload_encoding": { "const": "hpke_chacha20poly1305_b64url" }
+            },
+            "required": ["payload_encoding"]
+          },
+          "then": {
+            "required": ["channel_seq"],
+            "properties": {
+              "channel_seq": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "HandshakeInit": {
+      "type": "object",
+      "description": "Initial ephemeral X25519 key exchange frame sent by Chrome Extension Service Worker to rsv-daemon.",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "extension_id",
+        "browser_label",
+        "ext_ephemeral_x25519_pk",
+        "ext_longterm_ed25519_pk",
+        "client_nonce"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "HandshakeInit"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "extension_id": {
+          "$ref": "#/$defs/ChromeExtensionId"
+        },
+        "browser_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Human-readable browser/profile label shown in rsv-desktop SAS pairing modal."
+        },
+        "ext_ephemeral_x25519_pk": {
+          "$ref": "#/$defs/Base64Url",
+          "minLength": 43,
+          "maxLength": 43,
+          "description": "32-byte ephemeral X25519 public key (43 base64url chars)."
+        },
+        "ext_longterm_ed25519_pk": {
+          "$ref": "#/$defs/Base64Url",
+          "minLength": 43,
+          "maxLength": 43,
+          "description": "32-byte non-extractable persistent Extension identity public key pinned upon SAS approval."
+        },
+        "client_nonce": {
+          "$ref": "#/$defs/Base64Url",
+          "minLength": 43,
+          "maxLength": 43,
+          "description": "32-byte CSPRNG handshake nonce."
+        },
+        "client_identity_proof_sig": {
+          "oneOf": [
+            { "$ref": "#/$defs/Base64Url" },
+            { "type": "null" }
+          ],
+          "description": "Optional Ed25519 signature over HandshakeInit fields binding ext_ephemeral_x25519_pk to ext_longterm_ed25519_pk."
+        }
+      }
+    },
+    "HandshakeComplete": {
+      "type": "object",
+      "description": "Daemon handshake response establishing HPKE/X25519 ChaCha20-Poly1305 channel encryption and reporting SAS pairing status.",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocol_version",
+        "session_id",
+        "paired",
+        "pairing_required",
+        "daemon_ephemeral_x25519_pk",
+        "daemon_longterm_ed25519_pk",
+        "server_nonce",
+        "transcript_signature",
+        "channel_cipher_suite",
+        "rekey_after_messages",
+        "rekey_after_seconds"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "HandshakeComplete"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "session_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "paired": {
+          "type": "boolean",
+          "description": "True if ext_longterm_ed25519_pk is already pinned in rsv-daemon's authenticated trust store."
+        },
+        "pairing_required": {
+          "type": "boolean",
+          "description": "True if user must visually verify the 6-digit + 4-word SAS in rsv-desktop before vault commands are permitted."
+        },
+        "daemon_ephemeral_x25519_pk": {
+          "$ref": "#/$defs/Base64Url",
+          "minLength": 43,
+          "maxLength": 43
+        },
+        "daemon_longterm_ed25519_pk": {
+          "$ref": "#/$defs/Base64Url",
+          "minLength": 43,
+          "maxLength": 43
+        },
+        "server_nonce": {
+          "$ref": "#/$defs/Base64Url",
+          "minLength": 43,
+          "maxLength": 43
+        },
+        "transcript_signature": {
+          "$ref": "#/$defs/Base64Url",
+          "description": "Ed25519 signature by daemon_longterm_ed25519_sk over the SHA-256 handshake transcript hash."
+        },
+        "channel_cipher_suite": {
+          "type": "string",
+          "const": "HPKE-X25519-HKDF-SHA256-CHACHA20POLY1305"
+        },
+        "rekey_after_messages": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 1048576
+        },
+        "rekey_after_seconds": {
+          "type": "integer",
+          "minimum": 300,
+          "maximum": 3600
+        }
+      }
+    },
+    "IpcRequest": {
+      "type": "object",
+      "description": "Logical authenticated request decrypted inside the HPKE/ChaCha20-Poly1305 channel (Extension -> rsv-daemon).",
+      "additionalProperties": false,
+      "required": ["request_id", "sent_at_ms", "command"],
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "sent_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Client UTC Unix timestamp in milliseconds."
+        },
+        "command": {
+          "oneOf": [
+            { "$ref": "#/$defs/UnlockStatusRequest" },
+            { "$ref": "#/$defs/GetMatchesForOrigin" },
+            { "$ref": "#/$defs/GetCredentialForOrigin" },
+            { "$ref": "#/$defs/SignAuditRequest" },
+            { "$ref": "#/$defs/LockVault" },
+            { "$ref": "#/$defs/CopySecretToConcealedClipboard" },
+            { "$ref": "#/$defs/PingRequest" }
+          ]
+        }
+      }
+    },
+    "IpcResponse": {
+      "type": "object",
+      "description": "Logical authenticated response or daemon push event decrypted inside the HPKE/ChaCha20-Poly1305 channel (rsv-daemon -> Extension).",
+      "additionalProperties": false,
+      "required": ["request_id", "responded_at_ms", "ok", "payload"],
+      "properties": {
+        "request_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/UuidV7" },
+            { "type": "null" }
+          ],
+          "description": "Matches originating IpcRequest.request_id, or null for asynchronous daemon push events such as VaultLockedEvent."
+        },
+        "responded_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "payload": {
+          "oneOf": [
+            { "$ref": "#/$defs/UnlockStatus" },
+            { "$ref": "#/$defs/GetMatchesForOriginResponse" },
+            { "$ref": "#/$defs/GetCredentialForOriginResponse" },
+            { "$ref": "#/$defs/SignAuditResponse" },
+            { "$ref": "#/$defs/LockVaultResponse" },
+            { "$ref": "#/$defs/CopySecretToConcealedClipboardResponse" },
+            { "$ref": "#/$defs/PongResponse" },
+            { "$ref": "#/$defs/VaultLockedEvent" },
+            { "$ref": "#/$defs/IpcError" }
+          ]
+        }
+      }
+    },
+    "UnlockStatusRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "UnlockStatus"
+        },
+        "prompt_biometric_if_locked": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true and user initiated an explicit extension unlock action, triggers native OS biometric/enclave prompt in rsv-daemon."
+        }
+      }
+    },
+    "UnlockStatus": {
+      "type": "object",
+      "description": "Current lock state and non-secret session metadata reported by rsv-daemon.",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "state",
+        "daemon_version",
+        "enclave_attested",
+        "auto_lock_remaining_sec"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "UnlockStatus"
+        },
+        "state": {
+          "type": "string",
+          "enum": ["locked", "unlocked", "pairing_pending", "enclave_prompt_active"]
+        },
+        "daemon_version": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/UuidV7" },
+            { "type": "null" }
+          ]
+        },
+        "user_handle": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "enclave_attested": {
+          "type": "boolean"
+        },
+        "auto_lock_remaining_sec": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "active_cipher_suite": {
+          "type": ["string", "null"],
+          "enum": ["RSV-HYBRID-2026-V1", "RSV-HYBRID-FIPS-2026-V1", null]
+        }
+      }
+    },
+    "GetMatchesForOrigin": {
+      "type": "object",
+      "description": "Query non-secret credential summaries matching a verified tab origin (returns zero password/TOTP bytes).",
+      "additionalProperties": false,
+      "required": ["type", "top_origin", "frame_origin", "is_cross_origin_iframe"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "GetMatchesForOrigin"
+        },
+        "top_origin": {
+          "$ref": "#/$defs/HttpsOrLoopbackOrigin"
+        },
+        "frame_origin": {
+          "$ref": "#/$defs/HttpsOrLoopbackOrigin"
+        },
+        "is_cross_origin_iframe": {
+          "type": "boolean"
+        },
+        "include_passkeys": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "OriginCredentialSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "collection_id", "title", "username_hint", "has_password", "has_totp", "has_passkey", "match_strength"],
+      "properties": {
+        "item_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "collection_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "username_hint": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "has_password": {
+          "type": "boolean"
+        },
+        "has_totp": {
+          "type": "boolean"
+        },
+        "has_passkey": {
+          "type": "boolean"
+        },
+        "match_strength": {
+          "type": "string",
+          "enum": ["exact_origin", "psl_etld_plus_one", "equivalent_domain"]
+        }
+      }
+    },
+    "GetMatchesForOriginResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "matches", "cross_origin_warning_required"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "GetMatchesForOriginResponse"
+        },
+        "matches": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/OriginCredentialSummary"
+          }
+        },
+        "cross_origin_warning_required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "GetCredentialForOrigin": {
+      "type": "object",
+      "description": "Request ONLY the single scoped credential for a verified origin upon an explicit trusted user gesture. rsv-daemon validates origin binding and logs a local/server audit event before releasing the single secret.",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "item_id",
+        "top_origin",
+        "frame_origin",
+        "is_cross_origin_iframe",
+        "user_gesture_verified",
+        "cross_origin_explicit_consent",
+        "requested_fields"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "GetCredentialForOrigin"
+        },
+        "item_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "top_origin": {
+          "$ref": "#/$defs/HttpsOrLoopbackOrigin"
+        },
+        "frame_origin": {
+          "$ref": "#/$defs/HttpsOrLoopbackOrigin"
+        },
+        "is_cross_origin_iframe": {
+          "type": "boolean"
+        },
+        "user_gesture_verified": {
+          "type": "boolean",
+          "const": true,
+          "description": "MUST be true (verified from trusted user interaction in extension popup/shortcut/Closed Shadow DOM); rsv-daemon rejects false."
+        },
+        "cross_origin_explicit_consent": {
+          "type": "boolean",
+          "description": "MUST be true whenever is_cross_origin_iframe is true."
+        },
+        "requested_fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["username", "password", "totp_code"]
+          }
+        }
+      }
+    },
+    "GetCredentialForOriginResponse": {
+      "type": "object",
+      "description": "Ephemeral single-origin scoped credential payload. Extension MUST inject immediately and discard all references.",
+      "additionalProperties": false,
+      "required": ["type", "item_id", "bound_origin", "expires_at_ms"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "GetCredentialForOriginResponse"
+        },
+        "item_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "bound_origin": {
+          "$ref": "#/$defs/HttpsOrLoopbackOrigin"
+        },
+        "username": {
+          "type": ["string", "null"],
+          "maxLength": 1024
+        },
+        "password": {
+          "type": ["string", "null"],
+          "maxLength": 4096
+        },
+        "totp_code": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{6,8}$"
+        },
+        "totp_valid_for_sec": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 60
+        },
+        "expires_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Hard deadline (<= 5000 ms from issue) after which the extension MUST NOT inject this payload."
+        }
+      }
+    },
+    "SignAuditRequest": {
+      "type": "object",
+      "description": "Request rsv-daemon to construct and sign a deterministic CBOR AuditEnvelope using UIK (and optional HDIK countersignature) without exposing signing keys to the browser.",
+      "additionalProperties": false,
+      "required": ["type", "action", "target_id", "payload_sha256", "http_method", "canonical_path"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "SignAuditRequest"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "item.read",
+            "item.autofill",
+            "item.create",
+            "item.update",
+            "item.delete",
+            "session.revoke"
+          ]
+        },
+        "target_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "payload_sha256": {
+          "$ref": "#/$defs/Sha256Hex"
+        },
+        "http_method": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        },
+        "canonical_path": {
+          "type": "string",
+          "pattern": "^/api/v1/[A-Za-z0-9._/~-]+$"
+        },
+        "canonical_query": {
+          "type": "string",
+          "default": ""
+        }
+      }
+    },
+    "SignAuditResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "audit_envelope_cbor_b64url",
+        "request_signature_header",
+        "device_id",
+        "tenant_id"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "SignAuditResponse"
+        },
+        "audit_envelope_cbor_b64url": {
+          "$ref": "#/$defs/Base64Url",
+          "description": "Signed RFC 8949 deterministic CBOR AuditEnvelope ready for X-RSV-Audit-Envelope header."
+        },
+        "request_signature_header": {
+          "type": "string",
+          "description": "Complete X-RSV-Request-Signature header value signed by HDIK/UIK."
+        },
+        "device_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/UuidV7"
+        }
+      }
+    },
+    "LockVault": {
+      "type": "object",
+      "description": "Instruct rsv-daemon to immediately zeroize all unlocked keys in rsv-mem, drop enclave contexts, flush concealed clipboard entries, and broadcast VaultLockedEvent.",
+      "additionalProperties": false,
+      "required": ["type", "reason"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "LockVault"
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["user_requested", "browser_idle", "browser_locked", "security_policy"]
+        }
+      }
+    },
+    "LockVaultResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "locked", "zeroized_in_ms"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "LockVaultResponse"
+        },
+        "locked": {
+          "type": "boolean",
+          "const": true
+        },
+        "zeroized_in_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "CopySecretToConcealedClipboard": {
+      "type": "object",
+      "description": "Delegate clipboard copy directly to rsv-daemon so native OS concealment flags (ConcealedType / ExcludeClipboardContentFromMonitorProcessing / x-kde-passwordManagerHint) and non-clobber auto-clear apply.",
+      "additionalProperties": false,
+      "required": ["type", "item_id", "field", "ttl_sec"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "CopySecretToConcealedClipboard"
+        },
+        "item_id": {
+          "$ref": "#/$defs/UuidV7"
+        },
+        "field": {
+          "type": "string",
+          "enum": ["username", "password", "totp_code"]
+        },
+        "ttl_sec": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 120,
+          "default": 30
+        }
+      }
+    },
+    "CopySecretToConcealedClipboardResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "copied", "clear_at_ms"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "CopySecretToConcealedClipboardResponse"
+        },
+        "copied": {
+          "type": "boolean",
+          "const": true
+        },
+        "clear_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "PingRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "Ping"
+        }
+      }
+    },
+    "PongResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "daemon_time_ms"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "Pong"
+        },
+        "daemon_time_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "VaultLockedEvent": {
+      "type": "object",
+      "description": "Asynchronous push event broadcast by rsv-daemon immediately upon OS screen-lock, sleep, idle timeout, or explicit lock.",
+      "additionalProperties": false,
+      "required": ["type", "reason", "locked_at_ms"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "VaultLockedEvent"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "user_requested",
+            "idle_timeout",
+            "os_screen_lock",
+            "os_sleep",
+            "session_revoked",
+            "tamper_detected"
+          ]
+        },
+        "locked_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "IpcErrorCode": {
+      "type": "string",
+      "enum": [
+        "IPC_FRAME_TOO_LARGE",
+        "IPC_CHUNK_SEQUENCE_INVALID",
+        "IPC_CHUNK_TIMEOUT",
+        "IPC_PEER_AUTH_FAILED",
+        "IPC_PAIRING_REQUIRED",
+        "IPC_SAS_REJECTED",
+        "IPC_HANDSHAKE_FAILED",
+        "IPC_CHANNEL_DECRYPT_FAILED",
+        "IPC_VAULT_LOCKED",
+        "IPC_ORIGIN_MISMATCH",
+        "IPC_UNTRUSTED_GESTURE_REQUIRED",
+        "IPC_ITEM_NOT_FOUND",
+        "IPC_DAEMON_UNAVAILABLE",
+        "IPC_AUDIT_SIGN_FAILED",
+        "IPC_RATE_LIMITED",
+        "IPC_PROTOCOL_VERSION_UNSUPPORTED"
+      ]
+    },
+    "IpcError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "code", "message", "retryable"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "IpcError"
+        },
+        "code": {
+          "$ref": "#/$defs/IpcErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {
+          "type": ["object", "null"],
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

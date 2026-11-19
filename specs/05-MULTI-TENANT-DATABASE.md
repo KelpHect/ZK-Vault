@@ -24,7 +24,7 @@ A common anti-pattern in multi-tenant PostgreSQL architectures is **Schema-per-T
 
 | Failure Mode | Schema-per-Tenant at 5,000 Tenants | Shared Schema + `HASH(tenant_id)` + RLS (RusticStack Core) |
 | :--- | :--- | :--- |
-| **`pg_class` / `pg_attribute` Catalog Bloat** | 12 tables + ~35 indexes/TOAST objects per tenant $\approx 235{,}000$ `pg_class` rows and $\approx 2.1\text{M}$ `pg_attribute` rows. Per-backend `RelCache` / `CatCache` memory grows $O(\text{connections} \times \text{tenants})$, triggering OOM kills and multi-hour `pg_upgrade` stalls. | Fixed **12 parent tables + 320 leaf partitions** (`5 × 64`) regardless of whether the cluster hosts 10 or 50,000 tenants. Constant $O(1)$ catalog footprint. |
+| **`pg_class` / `pg_attribute` Catalog Bloat** | 17 tables + ~50 indexes/TOAST objects per tenant $\approx 335{,}000$ `pg_class` rows and $\approx 2.9\text{M}$ `pg_attribute` rows. Per-backend `RelCache` / `CatCache` memory grows $O(\text{connections} \times \text{tenants})$, triggering OOM kills and multi-hour `pg_upgrade` stalls. | Fixed **17 parent tables + 448 leaf partitions** (`7 × 64`) regardless of whether the cluster hosts 10 or 50,000 tenants. Constant $O(1)$ catalog footprint. |
 | **`ALTER TABLE` Lock Storms & Migration Duration** | Migrating 5,000 schemas requires 5,000 `ACCESS EXCLUSIVE` locks, exhausting `max_locks_per_transaction`, creating lock-queue pileups, and leaving tenants on heterogeneous schema versions for 30–120 minutes. | Single atomic Expand-and-Contract DDL operation completes in milliseconds with strict `lock_timeout = '2s'`. All tenants share one schema version atomically. |
 | **Connection Pool & Prepared Statement Thrashing** | `SET search_path` invalidates/fragments backend plans across PgBouncer connections, creating $O(\text{queries} \times \text{tenants})$ backend plans and spiking CPU inside `Parse`/`Bind`. | Uniform `vault.*` qualified SQL allows 100% prepared-statement plan reuse across all tenants under PgBouncer transaction pooling. |
 | **Autovacuum & OS Page Cache Fragmentation** | 200,000+ sparse heap/index files exhaust `max_files_per_process`, fragment OS page cache, and starve `autovacuum_max_workers`. | 64 compact HASH partitions concentrate hot pages in `shared_buffers` and allow balanced parallel autovacuum across 64 relations. |
@@ -55,7 +55,7 @@ flowchart TB
 
     subgraph L3["Layer 3: PostgreSQL 17/18 FORCE RLS + LEAKPROOF InitPlan"]
         RoleGuard["Role rsv_app: NOSUPERUSER NOBYPASSRLS"]
-        ForceRLS["ENABLE + FORCE ROW LEVEL SECURITY on all 12 vault.* tables"]
+        ForceRLS["ENABLE + FORCE ROW LEVEL SECURITY on all 17 vault.* tables"]
         Policy["USING (tenant_id = (SELECT NULLIF(current_setting('app.current_tenant_id', true), '')::uuid))"]
         FKGuard["Composite Foreign Keys (tenant_id, entity_id) prevent cross-tenant joins"]
     end
@@ -94,7 +94,7 @@ To achieve **both** ironclad DB-enforced isolation AND optimal PostgreSQL 17/18 
    ```
    The third argument `is_local = true` scopes the GUC strictly to the active transaction (`BEGIN ... COMMIT`/`ROLLBACK`). When the transaction terminates and PgBouncer returns the backend connection to the pool, PostgreSQL automatically clears `app.current_tenant_id`.
 2. **Mandatory Explicit `WHERE tenant_id = $1` in Every Query**: Every query executed through `TenantScopedTx` **MUST** explicitly pass `tx.tenant_id()` as `$1` in a `WHERE tenant_id = $1` (or `ON e.tenant_id = $1`) predicate. This allows PostgreSQL to perform immediate partition pruning (`Subplans Removed: 63`), select optimal single-partition `(tenant_id, ...)` composite index scans, and avoid planning regressions under prepared statements.
-3. **InitPlan-Cached `FORCE ROW LEVEL SECURITY` Backstop**: All 12 tables in schema `vault` execute:
+3. **InitPlan-Cached `FORCE ROW LEVEL SECURITY` Backstop**: All 17 tables in schema `vault` execute:
    ```sql
    ALTER TABLE vault.<table_name> ENABLE ROW LEVEL SECURITY;
    ALTER TABLE vault.<table_name> FORCE ROW LEVEL SECURITY;
@@ -234,16 +234,16 @@ pub enum DbInitError {
 
 ---
 
-## 4. Canonical 12-Table Layout, Partitioning & UUIDv7 Locality
+## 4. Canonical 17-Table Layout, Partitioning & UUIDv7 Locality
 
 ### 4.1 Complete Table Inventory (`vault` Schema)
 
-All 12 tables defined in [`schemas/postgresql-schema.sql`](../schemas/postgresql-schema.sql) lead every primary key, unique constraint, secondary index, and foreign key with `tenant_id UUID NOT NULL` and enforce `ENABLE` + `FORCE ROW LEVEL SECURITY`:
+All 17 canonical tables (12 core + 5 extension tables) defined in [`schemas/postgresql-schema.sql`](../schemas/postgresql-schema.sql) lead every primary key, unique constraint, secondary index, and foreign key with `tenant_id UUID NOT NULL` and enforce `ENABLE` + `FORCE ROW LEVEL SECURITY`:
 
 | # | Table Name | Partitioning Strategy | Primary Key | Mutability | Primary Workload |
 | :-: | :--- | :--- | :--- | :--- | :--- |
 | 1 | `vault.tenants` | Unpartitioned | `(tenant_id)` | Mutable (`rsv_app`) | Tenant manifest, `ORPubK`/`DRPubK`/`CPubK`, `blind_epoch` |
-| 2 | `vault.tenant_vss_ceremonies` | Unpartitioned | `(tenant_id, ceremony_id)` | Mutable (`rsv_app`) | Feldman VSS 3-of-5 DKG, refresh & recovery ceremonies |
+| 2 | `vault.tenant_vss_ceremonies` | Unpartitioned | `(tenant_id, ceremony_id)` | Mutable (`rsv_app`) | Feldman VSS 3-of-5 DKG, encrypted commitments, refresh & recovery |
 | 3 | `vault.users` | Unpartitioned | `(tenant_id, user_id)` | Mutable (`rsv_app`) | User `UIK`/`UPK`, encrypted `USK`, Argon2id KDF params |
 | 4 | `vault.user_devices` | Unpartitioned | `(tenant_id, device_id)` | Mutable (`rsv_app`) | Hardware `HDIK` (ECDSA-P256), `HDSK`-wrapped `MUK`, attestation |
 | 5 | `vault.teams` | Unpartitioned | `(tenant_id, team_id)` | Mutable (`rsv_app`) | Team `current_key_epoch`, encrypted metadata |
@@ -251,20 +251,25 @@ All 12 tables defined in [`schemas/postgresql-schema.sql`](../schemas/postgresql
 | 7 | `vault.key_graph_edges` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, edge_id)` | Mutable + DAG Trigger | Blind RBAC wrapped key edges (`user_to_team`, `team_to_team`, etc.) |
 | 8 | `vault.vault_items` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, item_id)` | Mutable (`rsv_app`) | Latest item ciphertext, `wrapped_dek_collection`/`escrow`/`delegated` |
 | 9 | `vault.vault_item_revisions` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, item_id, item_version)` | **APPEND-ONLY** | Immutable version history with hash-chained `previous_revision_digest` |
-| 10 | `vault.audit_events` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, log_index)` | **APPEND-ONLY** | Blinded HMAC IDs, `CPubK` envelope, `HDIK` sig, RFC 9162 `leaf_hash` |
-| 11 | `vault.audit_merkle_tiles` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, tile_level, tile_index, partial_width)` | **APPEND-ONLY** | C2SP `tlog-tiles` 256-entry height-8 immutable binary hash tiles |
-| 12 | `vault.audit_checkpoints` | Unpartitioned | `(tenant_id, tree_size)` | **APPEND-ONLY** | C2SP signed checkpoints + witness cosignature quorum JSONB |
+| 10 | `vault.audit_events` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, log_index)` | **APPEND-ONLY** | Blinded HMAC IDs, `CPubK` envelope, `HDIK`/`MIK` sig, RFC 9162 `leaf_hash` |
+| 11 | `vault.audit_merkle_tiles` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, log_kind, tile_level, tile_index, partial_width)` | **APPEND-ONLY** | C2SP `tlog-tiles` 256-entry height-8 tiles (`audit` & `key_transparency`) |
+| 12 | `vault.audit_checkpoints` | Unpartitioned | `(tenant_id, tree_size)` | **APPEND-ONLY** | C2SP signed audit checkpoints + witness cosignature quorum JSONB |
+| 13 | `vault.key_transparency_log` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, kt_index)` | **APPEND-ONLY** | Verifiable user public key directory log (`SPEC-11`) |
+| 14 | `vault.key_transparency_checkpoints` | Unpartitioned | `(tenant_id, tree_size)` | **APPEND-ONLY** | Witnessed KT checkpoints + verifiable map root (`SPEC-11`) |
+| 15 | `vault.scim_pending_intents` | Unpartitioned | `(tenant_id, intent_id)` | Mutable (`rsv_app`) | Zero-key SCIM 2.0 provisioning/deprovisioning intent queue (`SPEC-11`) |
+| 16 | `vault.machine_identities` | Unpartitioned | `(tenant_id, machine_id)` | Mutable (`rsv_app`) | OIDC workload identity `MIK`/`MPK` bindings (`SPEC-12`) |
+| 17 | `vault.vault_attachments` | **`HASH(tenant_id)` (64 parts)** | `(tenant_id, attachment_id)` | Mutable (`rsv_app`) | STREAM `AES-256-GCM` chunked encrypted attachment manifests (`SPEC-13`) |
 
 ### 4.2 Why 64 HASH Partitions (`p00`..`p63`) & Scaling Path
 
-1. **Baseline (64 Partitions per High-Cardinality Table)**:
+1. **Baseline (64 Partitions per High-Cardinality Table — 7 Tables, 448 Partitions)**:
    - At 5,000 tenants averaging 20,000 audit events and 2,000 vault items each, `vault.audit_events` holds 100M rows (~80 GB) and `vault.vault_items` holds 10M rows (~20 GB).
    - Dividing across 64 `HASH(tenant_id)` partitions keeps each `audit_events_pXX` partition at ~1.5M rows (~1.25 GB) and each `vault_items_pXX` partition at ~156K rows (~310 MB).
    - Every partition's composite B-tree index stays at height $\le 3$ and remains hot inside `shared_buffers`, while `autovacuum` operates independently on up to `autovacuum_max_workers` partitions concurrently.
 2. **Mid-Scale Expansion (64 $\to$ 256 Partitions)**:
    - Because PostgreSQL HASH partitioning fixes `MODULUS`, transitioning from 64 to 256 partitions is performed with near-zero downtime via PostgreSQL logical replication (`CREATE PUBLICATION` $\to$ 256-partition subscriber cluster $\to$ read-only fence & DNS/PgBouncer cutover).
 3. **Enterprise Whale Scale (Dedicated Cell Sharding)**:
-   - Tenants exceeding 50,000 seats or requiring sovereign data residency (EU/FedRAMP) are routed at the API gateway (`rsv-server` cell directory) to a dedicated PostgreSQL cell running the **exact same 12-table `vault` schema**. Zero application SQL changes are required.
+   - Tenants exceeding 50,000 seats or requiring sovereign data residency (EU/FedRAMP) are routed at the API gateway (`rsv-server` cell directory) to a dedicated PostgreSQL cell running the **exact same 17-table `vault` schema**. Zero application SQL changes are required.
 
 ### 4.3 UUIDv7 Temporal Locality Inside Composite B-Tree Indexes
 
@@ -312,8 +317,8 @@ ignore_startup_parameters = extra_float_digits,options
 | PostgreSQL Role | Attributes | Permitted Operations | Purpose |
 | :--- | :--- | :--- | :--- |
 | `rsv_migrator` | `NOLOGIN NOSUPERUSER NOBYPASSRLS` | Owns `vault` schema; DDL migrations; controlled single-tenant crypto-shred purge | CI/CD migration runner only |
-| `rsv_app` | `NOLOGIN NOSUPERUSER NOBYPASSRLS` | `SELECT/INSERT/UPDATE` on 8 mutable tables; `SELECT/INSERT` ONLY on 4 immutable tables; `EXECUTE` on `resolve_tenant_id_by_slug` | Runtime `rsv-server` API pool |
-| `rsv_auditor_ro` | `NOLOGIN NOSUPERUSER NOBYPASSRLS` | `SELECT` ONLY on `tenants`, `tenant_vss_ceremonies`, `user_devices`, `audit_events`, `audit_merkle_tiles`, `audit_checkpoints` | Compliance CLI / read-replica audit verification |
+| `rsv_app` | `NOLOGIN NOSUPERUSER NOBYPASSRLS` | `SELECT/INSERT/UPDATE` on 11 mutable tables; `SELECT/INSERT` ONLY on 6 immutable tables; `EXECUTE` on `resolve_tenant_id_by_slug` | Runtime `rsv-server` API pool |
+| `rsv_auditor_ro` | `NOLOGIN NOSUPERUSER NOBYPASSRLS` | `SELECT` ONLY on `tenants`, `tenant_vss_ceremonies`, `user_devices`, `audit_events`, `audit_merkle_tiles`, `audit_checkpoints`, `key_transparency_log`, `key_transparency_checkpoints`, `scim_pending_intents`, `machine_identities`, `vault_attachments` | Compliance CLI / read-replica audit verification |
 | `rsv_slug_resolver` | `NOLOGIN NOSUPERUSER NOBYPASSRLS` | Column-level `SELECT (tenant_id, slug, status)` on `vault.tenants` ONLY | Owner of narrow `SECURITY DEFINER` pre-auth slug lookup |
 
 ---
@@ -323,7 +328,7 @@ ignore_startup_parameters = extra_float_digits,options
 Every hot-path query in `rsv-server` **MUST** satisfy three strict CI-verified planner invariants:
 
 1. **Zero `Seq Scan`** on any partitioned or tenant-scoped operational table.
-2. **`Subplans Removed: 63`** (or single-partition direct scan) on all queries targeting the 5 HASH-partitioned tables.
+2. **`Subplans Removed: 63`** (or single-partition direct scan) on all queries targeting the 7 HASH-partitioned tables.
 3. **`Index Cond: (tenant_id = ...)`** leading every index scan, with the RLS `InitPlan` evaluated **at most once** per statement.
 
 ### 6.1 Target Plan 1: Active Collection Item Sync (`vault.vault_items`)
@@ -395,7 +400,7 @@ CI **MUST** execute the following negative security assertions as `rsv_app` on e
 1. **Unset GUC Fail-Closed**: `SELECT count(*) FROM vault.vault_items` with no `set_config` **MUST** return `0`, even when rows exist for multiple tenants.
 2. **Cross-Tenant Read Isolation**: With `app.current_tenant_id = Tenant_A`, executing `SELECT count(*) FROM vault.vault_items WHERE tenant_id = Tenant_B` **MUST** return `0`.
 3. **Cross-Tenant Write Rejection**: With `app.current_tenant_id = Tenant_A`, executing `INSERT INTO vault.vault_items (tenant_id, ...) VALUES (Tenant_B, ...)` **MUST** fail with PostgreSQL SQLSTATE `42501` (`new row violates row-level security policy`).
-4. **Immutability Enforcement**: Executing `UPDATE` or `DELETE` on `vault.audit_events`, `vault.audit_merkle_tiles`, `vault.audit_checkpoints`, or `vault.vault_item_revisions` **MUST** fail with `42501` (`APPEND_ONLY_VIOLATION`).
+4. **Immutability Enforcement**: Executing `UPDATE` or `DELETE` on `vault.audit_events`, `vault.audit_merkle_tiles`, `vault.audit_checkpoints`, `vault.key_transparency_log`, `vault.key_transparency_checkpoints`, or `vault.vault_item_revisions` **MUST** fail with `42501` (`APPEND_ONLY_VIOLATION`).
 
 ---
 
@@ -456,7 +461,7 @@ sequenceDiagram
 
 ### 8.1 Single-Tenant Logical Export
 
-1. **Isolation Guarantee**: Export workers open a `REPEATABLE READ` read-only `TenantScopedTx` using `rsv_auditor_ro` (or a dedicated read-only export role with `NOBYPASSRLS`), guaranteeing snapshot consistency across all 12 tables for exactly one `tenant_id`.
+1. **Isolation Guarantee**: Export workers open a `REPEATABLE READ` read-only `TenantScopedTx` using `rsv_auditor_ro` (or a dedicated read-only export role with `NOBYPASSRLS`), guaranteeing snapshot consistency across all 17 tables for exactly one `tenant_id`.
 2. **Zero-Knowledge Export Bundle**: The exported archive contains strictly ciphertexts (`vault_items`, `vault_item_revisions`, `key_graph_edges`, `teams`, `collections`, `users`), public identity metadata, and the full RFC 9162 Merkle audit ledger (`audit_events`, `audit_merkle_tiles`, `audit_checkpoints`), signed with the tenant's latest checkpoint root hash.
 
 ### 8.2 GDPR Crypto-Shredding vs. Immutable Audit Logs

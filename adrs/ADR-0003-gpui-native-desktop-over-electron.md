@@ -13,7 +13,7 @@
 
 ## 1. Context and Problem Statement
 
-RusticStack Core (`ZK-Vault`) requires a flagship cross-platform desktop client for macOS, Windows, and Linux capable of managing post-quantum hybrid cryptographic keys (`ML-KEM-768 + X25519`, `ML-DSA-65 + Ed25519`), binding to hardware roots of trust (`rsv-enclave`: Apple Secure Enclave, Windows TPM 2.0/CNG, Linux TPM 2.0/CTAP2), holding unlocked key material strictly in locked physical memory (`rsv-mem`), and delivering instant (< 16 ms input-to-photon, 120 FPS) search and credential workflows across enterprise vaults containing tens of thousands of items.
+RusticStack Core (`ZK-Vault`) requires a flagship cross-platform desktop client for macOS, Windows, and Linux capable of managing classical (`CS-01`: `X25519` HPKE, `Ed25519`, `AES-256-GCM`) and post-quantum hybrid (`CS-02`: **X-Wing** `X25519 + ML-KEM-768` SHA3-256 combiner, hybrid `Ed25519 + ML-DSA-65`, `AES-256-GCM`) cryptographic keys, binding to Two-Tier silicon hardware roots of trust (`rsv-enclave`: NIST P-256 `HDIK`/`HDSK` on Apple Secure Enclave, Windows TPM 2.0/CNG, and Linux TPM 2.0/CTAP2 per `INV-013`), holding unlocked key material strictly in locked physical memory (`rsv-mem`), and delivering instant (< 16 ms input-to-photon, 120 FPS) search and credential workflows across enterprise vaults containing tens of thousands of items.
 
 Historically, commercial password managers have shipped desktop clients built on **Electron** (embedded Chromium + Node.js + V8) or OS WebView wrappers (**Tauri**). While web-based desktop shells accelerate initial UI prototyping, they introduce fundamental security and engineering hazards for a zero-knowledge vault:
 

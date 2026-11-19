@@ -404,7 +404,7 @@ On every graph mutation (`POST /api/v1/graph/edges`, `PATCH /api/v1/teams/{team_
 | **1. Tenant Binding** | Verify authenticated JWT/session `tenant_id` matches path/body `tenant_id` and `TenantScopedTx` context | `tenant_id` UUID | `TENANT_MISMATCH` |
 | **2. Cipher Suite Policy** | Verify `edge.cipher_suite` is enabled by tenant policy (`CS-01 = 1` or `CS-02 = 2`) | `cipher_suite` integer | `UNSUPPORTED_CIPHER_SUITE` |
 | **3. Coarse Write Auth** | Verify `grantor_user_id` is `status = 'active'` and holds tenant `owner`/`admin` role OR an active edge to the target with `MANAGE_MEMBERS` (`0x04`) / `ROTATE_KEYS` (`0x08`) | `users.role`, `key_graph_edges.permission_mask` | `INVALID_SIGNATURE` / HTTP `403` |
-| **4. AAD Digest Consistency** | Recompute `SHA-256(wrap_aad)` from cleartext edge columns and compare constant-time to `wrap_aad_digest` | Structural columns + `wrap_aad_digest` | `INVALID_SIGNATURE` |
+| **4. AAD Digest Consistency** | Recompute `SHA-256(canonical_aad_cbor)` (`SPEC-02 §4.2`) from cleartext edge columns and compare constant-time to `wrap_aad_digest` & `RSV1_Header[16..48]` | Structural columns + `wrap_aad_digest` + `RSV1` header | `INVALID_SIGNATURE` |
 | **5. Grantor UIK Signature** | Recompute `edge_commitment` and verify `grantor_uik_signature` against `users.uik_public_key` (`Ed25519` or Hybrid `Ed25519+ML-DSA-65`) | `uik_public_key`, `grantor_uik_signature` | `INVALID_SIGNATURE` |
 | **6. Monotonic Epoch Guard** | For edge creation: `target_epoch` **MUST** equal target's `current_key_epoch` (or `current_key_epoch + 1` during atomic rotation). Downgrades **MUST** be rejected | `teams.current_key_epoch`, `collections.current_key_epoch` | `STALE_KEY_EPOCH` |
 | **7. Escrow Tier Enforcement** | For `enterprise_escrow` / `standard` tiers: every new team/collection epoch **MUST** include an `escrow_to_team` / `escrow_to_collection` edge with `source_epoch = tenants.orpk_epoch`; `vault_items` **MUST** satisfy `chk_vault_items_escrow_policy` | `tenants.escrow_tier`, `collections.escrow_tier`, presence of escrow edges/columns | `ESCROW_POLICY_VIOLATION` |
@@ -470,26 +470,29 @@ SELECT
 
 ## 6. Normative Rust Trait Contracts (`rsv-graph`)
 
-The `rsv-graph` crate **MUST** be `#![no_std]`-compatible (with `alloc`) so the exact same validation, AAD construction, and topological resolution logic runs identically across `rsv-server`, `rsv-desktop`, `rsv-daemon`, `rsv-wasm`, and `rsv-compliance-cli`.
+The `rsv-graph` crate **MUST** be `#![no_std]`-compatible (with `alloc`) and strictly obey the Tier-0 dependency firewall (zero dependency on `rsv-mem`, `tokio`, `sqlx`, or OS FFI) so the exact same validation, AAD construction, and topological resolution logic runs identically across `rsv-server`, `rsv-desktop`, `rsv-daemon`, `rsv-wasm`, and `rsv-compliance-cli`.
+
+> [!NOTE]
+> **Workspace Contract Alignment (`agents/CRATE-CONTRACTS.md`):** The authoritative, compile-locked workspace crate API signatures for `rsv-graph` (including `BlindKeyGraph`, `ValidatedGraph`, `RotationPlan`, and `GraphError`) are defined in [`agents/CRATE-CONTRACTS.md`](../agents/CRATE-CONTRACTS.md) Section 3.4. The conceptual domain traits below elaborate the internal resolver, planner, and blind-validator responsibilities and **MUST** remain semantically aligned with `agents/CRATE-CONTRACTS.md`.
 
 ```rust
 //! Normative trait contracts for crate `rsv-graph` (Rust 2024 Edition, MSRV 1.94.0).
 //! Spec: RSV-SPEC-04 (04-BLIND-RBAC-ACCESS-GRAPH.md)
 
+#![no_std]
 #![forbid(unsafe_code)]
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 use rsv_crypto::{CipherSuiteId, PublicKeyBytes, SignatureBytes, SymmetricKey256, VerifiedRootManifest};
-use rsv_mem::SecretBox;
+use secrecy::SecretBox;
 use rsv_types::{
     CollectionId, EdgeId, EscrowTier, KeyEpoch, TeamId, TenantId, UserId, VaultItemId,
 };
 
 /// Hard architectural upper bound on nested `team_to_team` hops.
 pub const MAX_GRAPH_DEPTH: u8 = 4;
-
-/// Domain separation prefix for canonical edge key-wrap AAD.
-pub const GRAPH_WRAP_AAD_DOMAIN: &[u8] = b"rsv:graph:wrap:v1";
 
 /// Domain separation prefix for grantor UIK edge signatures.
 pub const GRAPH_EDGE_SIG_DOMAIN: &[u8] = b"rsv:graph:edge:sig:v1";
@@ -666,7 +669,8 @@ pub struct RotationContext {
     pub affected_collections: Vec<(CollectionId, KeyEpoch, EscrowTier)>,
 }
 
-/// Signed atomic mutation payload submitted to `POST /api/v1/graph/rotations/atomic`.
+/// Signed atomic mutation payload submitted to `PATCH /api/v1/teams/{team_id}/rotate`
+/// and `PATCH /api/v1/collections/{collection_id}/rotate`.
 #[derive(Debug, Clone)]
 pub struct AtomicRotationBatch {
     pub tenant_id: TenantId,
@@ -686,7 +690,7 @@ pub struct AtomicRotationBatch {
 | :--- | :--- |
 | **Rogue DBA grants themselves `user_to_team` row in Postgres** | Without a valid HPKE wrap of `TK` encrypted to their `UPK`, the inserted row contains garbage bytes; AES/HPKE unwrap fails. Furthermore, clients reject edges lacking a valid `grantor_uik_signature` anchored in the signed Tenant Root Manifest. |
 | **Compromised server swaps new user's `UPK` with attacker's `UPK` during provisioning** | Admin client verifies `upk_uik_signature` AND verifies the user's `UIK` against OIDC/SSO attestation or signed Root Manifest transparency proof before sealing `TK`/`CK`. |
-| **Edge Replay / Cross-Tenant Edge Transplant** | `wrap_aad` cryptographically binds `tenant_id`, `edge_type`, `source_id`, `source_epoch`, `target_id`, `target_epoch`, `permission_mask`, and `cipher_suite`. Any field alteration causes AEAD authentication failure. |
+| **Edge Replay / Cross-Tenant Edge Transplant** | `SPEC-02 §4.2` `RSV1` header + `CanonicalAadContext` cryptographically binds `tenant_id`, `subject_id`, `parent_id`, `wrapping_key_role`, `wrapping_key_epoch`, `target_version_or_epoch`, `cipher_suite_id`, `escrow_tier`, and `extra_context(edge_type, permission_mask)`. Any field alteration causes AEAD authentication failure. |
 | **Concurrent Cycle Injection (`A -> B` and `B -> A`)** | Per-tenant transaction-scoped advisory lock `pg_advisory_xact_lock` serializes `team_to_team` mutations; both `rsv-graph` and DB trigger `trg_key_graph_edges_validate_dag` reject cycles and depth `> 4` with `GRAPH_CYCLE_REJECTED`. |
 | **Stale Client Encrypts New Secret Under Revoked Member's Old `CK(c)`** | `rsv-server` enforces `item.collection_key_epoch == collections.current_key_epoch` on all writes, returning `STALE_KEY_EPOCH` until the client fetches `CK(c+1)`. |
 | **Malicious Admin Strips Escrow Wrap to Create Unrecoverable Shadow Vault** | `rsv-server` checks `escrow_to_team` / `escrow_to_collection` presence during rotation AND PostgreSQL `chk_vault_items_escrow_policy` hard-blocks non-compliant `vault_items` inserts with `ESCROW_POLICY_VIOLATION`. |

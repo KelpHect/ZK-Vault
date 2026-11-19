@@ -525,6 +525,8 @@ Under `CS-02`, protocol identity keys (`UIK`, audit checkpoint signers, ceremony
 
 ## 9. Normative Rust Trait Contracts (`rsv-crypto` & `rsv-vss`)
 
+> **Frozen `M0` Trait Contract Authority**: The Rust traits below define the cryptographic semantics and invariants for `rsv-crypto` and `rsv-vss`. The frozen `M0` workspace compilation contract (exact signatures, `no_std + alloc` imports, and shared crate types) is governed authoritatively by [`agents/CRATE-CONTRACTS.md`](../agents/CRATE-CONTRACTS.md). In the event of any signature discrepancy during milestone implementation, `agents/CRATE-CONTRACTS.md` takes precedence.
+
 The following Rust 2024 trait definitions are normative contracts for `rsv-crypto` and `rsv-vss`. Implementations MUST preserve secret-wrapping via `secrecy::SecretBox` and `zeroize::ZeroizeOnDrop` at every API boundary so raw secret key bytes are never exposed as plain `Vec<u8>` or `[u8; 32]` types.
 
 ### 9.1 `rsv-crypto` Normative Traits & Types
@@ -546,16 +548,19 @@ pub enum CipherSuiteId {
     Cs02PostQuantumHybrid = 0x0002,
 }
 
-/// Collection escrow tier enforced cryptographically in Canonical AAD.
+/// Collection escrow tier matching PostgreSQL `vault.escrow_tier`, enforced cryptographically in Canonical AAD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EscrowTier {
-    /// Dual-escrowed under ORPubK + DRPubK (supports daily Helpdesk/SO recovery).
+    /// Wire/SQL `"standard"`: CK + ORPubK + DRPubK (supports daily Helpdesk/SO recovery).
     Standard,
-    /// Escrowed ONLY under ORPubK; DRPubK wrapping is cryptographically forbidden.
-    RootQuorumOnly,
+    /// Wire/SQL `"enterprise_escrow"` (root-quorum-only): CK + ORPubK ONLY; DRPubK wrapping is cryptographically forbidden.
+    EnterpriseEscrow,
+    /// Wire/SQL `"strict_zk"`: CK ONLY; both ORPubK and DRPubK organizational escrow wrappers are cryptographically forbidden.
+    StrictZk,
 }
 
-/// Structured context serialized to RFC 8949 Deterministic CBOR and bound into AEAD/HPKE AAD.
+/// Structured context serialized to RFC 8949 Deterministic CBOR and bound into ALL `RSV1` AEAD/HPKE AADs
+/// across `rsv-crypto`, `rsv-graph` (SPEC-04), and `rsv-audit` (SPEC-06).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalAadContext {
     pub schema_version: u8,          // MUST be 1
@@ -568,9 +573,12 @@ pub struct CanonicalAadContext {
     pub target_version_or_epoch: u32,
     pub cipher_suite: CipherSuiteId,
     pub escrow_tier: Option<EscrowTier>,
+    /// CBOR map key `11`: optional pre-encoded RFC 8949 deterministic CBOR map carrying domain-specific
+    /// extensions (e.g., `rsv-graph` `edge_type`/`permission_mask` or `rsv-audit` `device_id`/`idempotency_key`).
+    pub extra_context: Option<Vec<u8>>,
 }
 
-/// Opaque 256-bit symmetric key wrapper (DEK, CK, TK, MUK, TBK).
+/// Opaque 256-bit symmetric key wrapper (DEK, AEK, CK, TK, MUK).
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SymmetricKey256([u8; 32]);
 
@@ -695,11 +703,13 @@ pub trait SignatureSuite: Send + Sync {
     ) -> Result<(), CryptoError>;
 }
 
-/// Normative Item Encryption & Dual-Escrow Policy Enforcer.
+/// Normative Item Encryption & Three-Tier Escrow Policy Enforcer.
 pub trait VaultItemCipher: Send + Sync {
-    /// Mints a fresh 256-bit DEK, encrypts item payload, wraps DEK under CK & ORPubK,
+    /// Mints a fresh 256-bit DEK, encrypts item payload, wraps DEK under CK,
+    /// wraps under ORPubK IFF `escrow_tier` is `Standard` or `EnterpriseEscrow`,
     /// and wraps under DRPubK IFF `escrow_tier == EscrowTier::Standard`.
-    /// MUST return `CryptoError::PolicyViolation` if `dr_pubk.is_some()` on `RootQuorumOnly`.
+    /// MUST return `CryptoError::PolicyViolation` if `dr_pubk.is_some()` on `EnterpriseEscrow`
+    /// or `StrictZk`, or if `or_pubk.is_some()` on `StrictZk`.
     fn encrypt_item_revision(
         &self,
         tenant_id: [u8; 16],
@@ -708,7 +718,7 @@ pub trait VaultItemCipher: Send + Sync {
         revision_number: u32,
         escrow_tier: EscrowTier,
         ck: (&SecretBox<SymmetricKey256>, u32),
-        or_pubk: (&[u8], u32, CipherSuiteId),
+        or_pubk: Option<(&[u8], u32, CipherSuiteId)>,
         dr_pubk: Option<(&[u8], u32, CipherSuiteId)>,
         plaintext_cbor: &[u8],
     ) -> Result<EncryptedItemRevisionBundle, CryptoError>;
@@ -717,7 +727,7 @@ pub trait VaultItemCipher: Send + Sync {
 pub struct EncryptedItemRevisionBundle {
     pub payload_envelope: CiphertextEnvelope,
     pub dek_collection_envelope: CiphertextEnvelope,
-    pub dek_escrow_root_envelope: CiphertextEnvelope,
+    pub dek_escrow_root_envelope: Option<CiphertextEnvelope>,
     pub dek_escrow_delegated_envelope: Option<CiphertextEnvelope>,
 }
 ```
@@ -868,7 +878,7 @@ An implementation of `rsv-crypto` and `rsv-vss` SHALL NOT be promoted to release
    - RFC 9106 Argon2id v1.3 KATs and rejection tests for `m < 65536`, `t < 3`, `p < 4`.
    - Ed25519 Wycheproof / Zip215 strict-malleability rejection vectors (small-order points, non-canonical $S \ge \ell$).
 2. **AAD Transplantation Negative Tests**:
-   - Mutating ANY single field of `CanonicalAadContext` (`tenant_id`, `subject_id`, `parent_id`, `wrapping_key_role`, `wrapping_key_epoch`, `target_version_or_epoch`, `cipher_suite`, `escrow_tier`) MUST trigger `CryptoError::AadMismatch` or `CryptoError::AuthenticationFailed`.
+   - Mutating ANY single field of `CanonicalAadContext` (`tenant_id`, `subject_id`, `parent_id`, `wrapping_key_role`, `wrapping_key_epoch`, `target_version_or_epoch`, `cipher_suite`, `escrow_tier`, `extra_context`) MUST trigger `CryptoError::AadMismatch` or `CryptoError::AuthenticationFailed`.
    - Mutating ANY header byte of `RSV1` (`KeyEpoch`, `CipherSuiteId`, `Reserved`, `CiphertextLen`) MUST fail authentication.
 3. **Feldman VSS Mathematical Property Tests**:
    - Every $\binom{n}{t}$ subset of shares reconstructs the exact bit-for-bit 256-bit `ORPK_SEED` for $(t, n) \in \{(2, 3), (3, 5), (5, 9)\}$.
@@ -877,4 +887,4 @@ An implementation of `rsv-crypto` and `rsv-vss` SHALL NOT be promoted to release
    - Statistical distribution test over 10,000 splits verifying high 124 padding bits of $s_k$ pass chi-squared uniformity and ALWAYS satisfy $s_k < 2^{252}$.
    - Proactive resharing test: refreshed shares reconstruct identical `ORPK_SEED` and `C_{k,0}`, whereas mixing old-epoch and new-epoch shares fails verification and cannot reconstruct `ORPK_SEED`.
 4. **Policy Enforcement Tests**:
-   - Attempting to supply `dr_pubk = Some(...)` on `EscrowTier::RootQuorumOnly` MUST fail with `CryptoError::PolicyViolation`.
+   - Attempting to supply `dr_pubk = Some(...)` on `EscrowTier::EnterpriseEscrow` (root-quorum-only) or `EscrowTier::StrictZk`, or supplying `or_pubk = Some(...)` on `EscrowTier::StrictZk`, MUST fail with `CryptoError::PolicyViolation`.
